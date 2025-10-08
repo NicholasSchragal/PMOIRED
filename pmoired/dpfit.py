@@ -1313,7 +1313,8 @@ def dispCor(fit, ndigit=2, pre='', asStr=False, html=False, maxlen=140):
                     else:
                         tmp = '++'
                 elif ndigit==2:
-                    tmp = '%3d'%int(round(100*x, 0))
+                    # The value inside the int() 2 lines down can be NaN, handle it properly
+                    tmp = '%3d'%int(np.nan_to_num(np.round(100*x, 0)))
 
             if not asStr:
                 print(c+col+tmp+'\033[0m', end=' ')

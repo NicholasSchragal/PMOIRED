@@ -4407,7 +4407,8 @@ def analyseGrid(fits, expl, debug=False, verbose=1, deltaChi2=None):
 
     if debug or verbose:
         print('unique minima:', len(tmp), '/', len(res), end=' ')
-        print('[~%.1f first guesses / minima]'%(len(res)/len(tmp)))
+        # Nick Schragal - Converted this to an np.divide to properly handle division by 0 without throwing errors.
+        print('[~%.1f first guesses / minima]'%(np.divide(len(res),len(tmp))))
         if len(tmp)<len(res)/4:
             print('  few unique minima -> grid too fine / Nfits too large?')
         elif len(tmp)<=len(res)/2:
@@ -6671,7 +6672,12 @@ def showBootstrap(b, fig=0, figWidth=None, showRejected=False, ignore=None,
         else:
             # -- guess number of bins
             if k1 in boot['uncer']:
-                bins = int(3*np.ptp(boot['all best'][k1])/boot['uncer'][k1])
+                # Nick Schragal - The bins value can end up as infinite, so handle it, set to 10 if it is not a finite nubmer.
+                pre_bins = 3*np.ptp(boot['all best'][k1])/boot['uncer'][k1]
+                if not np.isnan(pre_bins):
+                    bins = int(pre_bins)
+                else:
+                    bins = 10
             else:
                 bins = 10
             bins = min(bins, len(boot['mask'])//5)
@@ -6679,7 +6685,9 @@ def showBootstrap(b, fig=0, figWidth=None, showRejected=False, ignore=None,
 
             nd = np.abs(np.mean(boot['all best'][k1])/np.ptp(boot['all best'][k1]))
             if nd>0:
-                nd = int(np.log10(nd))
+                # There's a bug here, if np.log10(nd) evaluates to np.inf, this will break everything.
+                p_nd = np.log10(nd)
+                nd = int(p_nd) if np.isfinite(p_nd) else int(0)
 
             if nd>=4:
                 offs[k1] = np.round(np.mean(boot['all best'][k1]), nd)
@@ -6728,9 +6736,11 @@ def showBootstrap(b, fig=0, figWidth=None, showRejected=False, ignore=None,
                             xerr=xerr ,
                             color=_color, fmt='d',
                             capsize=fontsize/2, label='bootstrap', markersize=fontsize/2)
-
-                n = max(int(np.ceil(-np.log10(boot['uncer+'][k1])+1)),
-                        int(np.ceil(-np.log10(boot['uncer-'][k1])+1)))
+                # The integers being converted here can be non-finite. Treat them properly
+                n = np.amax([
+                        np.ceil(-np.log10(boot['uncer+'][k1])+1),
+                        np.ceil(-np.log10(boot['uncer-'][k1])+1)
+                    ]).astype(int)
                 check = 2*np.abs(boot['uncer+'][k1]-boot['uncer-'][k1])/\
                           (boot['uncer+'][k1]+boot['uncer-'][k1]) < 0.2
                 if check:
