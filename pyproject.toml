@@ -9,7 +9,9 @@ exclude = ["banner"]
 [tool.setuptools.package-data]
 pmoired = ["newVltiHzn_obsDoors.txt",
            "transir_gravity.pckl",
-           "Model definitions and examples.ipynb"]
+           "Model definitions and examples.ipynb",
+           "Rosseland_SATLAS_giants.dat",
+           "Rosseland_SATLAS_dwarfs.dat"]
 
 [tool.setuptools.dynamic]
 version = {attr='pmoired.__version__'}
@@ -42,7 +44,8 @@ dependencies = [
     "matplotlib >= 3.8.0",
     "astropy >= 6.0.0",
     "astroquery >= 0.4.4",
-    'importlib_resources; python_version < "3.9"'
+    'importlib_resources; python_version < "3.9"',
+    "pyserial >= 3.5",
 ]
 
 [project.urls]
