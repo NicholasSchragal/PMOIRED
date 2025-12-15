@@ -4318,6 +4318,7 @@ def compute_minima_groups_vectorized(res, uncer, fitOnly, chi2, ignore):
     ignore : list
         Updated, includes all grouped indices.
     """
+    print("Using vectorized unique minima function.")
 
     n = len(res)
 
