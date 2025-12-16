@@ -149,7 +149,7 @@ class OI:
         if type(filenames) == str and filenames.endswith(".pmrd"):
             if verbose:
                 print("loading session saved in", filenames)
-            self.load(filenames)
+            self.load(filenames, verbose = verbose)
         elif not filenames is None:
             if type(insname) == str or insname is None:
                 insname = [insname]
@@ -209,6 +209,11 @@ class OI:
         ]
         if withModel:
             ext.append('_model')
+        # Automatically include the detection limit results if present
+        if "_limexpl" in self.__dict__.keys():
+            ext.append("_limexpl")
+        # Things are not being restored correctly. Let's just dump the *whole dictionary* and see if that fixes it:
+        ext = list(self.__dict__.keys())
 
         with open(name, "wb") as f:
             data = {k: self.__dict__[k] for k in ext}
@@ -228,7 +233,7 @@ class OI:
         print("[size %.1fM]" % (os.stat(name).st_size / 2**20))
         return
 
-    def load(self, name, debug=False):
+    def load(self, name, debug=False, verbose = True):
         """
         Load session from a binary file (not OIFITS :()
 
@@ -239,6 +244,8 @@ class OI:
         # assert os.path.exists(name), 'file "'+name+'" does not exist'
         if not os.path.exists(name):
             raise Exception('file "' + name + '" does not exist')
+        if verbose:
+            print(f"Restoring pmrd file {name}")
         with open(name, "rb") as f:
             data = pickle.load(f)
         if type(data) == tuple and len(data) == 8:
