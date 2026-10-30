@@ -831,10 +831,11 @@ def visImage(image, scale, u, v, wl, debug=False):
 
 def visCube(cube, u, v, wl):
     """
-    cube:  {'image':, 'scale': 'WL':}
-        image: Nwl (wavelength, optional) x Nx x Ny (spatial)
+    cube:  {'image':, 'scale':, 'WL':, 'X':, 'Y':}
+        image or cube: Nwl (wavelength, optional) x Nx x Ny (spatial)
         scale: "scale", in mas
         wl: wavelength vector in um (ignored if cube is 2D)
+        X, Y: 2D coordinates of the images
 
     values for the computations:
         u, v: spatial coordinates (vectors, in m)
@@ -843,12 +844,15 @@ def visCube(cube, u, v, wl):
     global _X, _Y
     res = np.zeros((len(u), len(wl)), np.complex64)
     _X, _Y = cube['X'], cube['Y']
+    k = 'image'
+    if 'cube' in cube and not 'image' in cube:
+        k = 'cube'
     if False:
         # == Interpolate in visibility space =============================
         # -- compute V(u,v) for each wl of the cube:
         tmp = np.zeros((len(u), len(cube['WL'])), np.complex64)
         for i, x in enumerate(cube['WL']):
-            tmp[:, i] = visImage(cube['image'][i, :, :], cube['scale'],
+            tmp[:, i] = visImage(cube[k][i, :, :], cube['scale'],
                                  u, v, cube['WL'][i])
         # -- interpolate
         for i in range(len(u)):
@@ -859,9 +863,9 @@ def visCube(cube, u, v, wl):
             # -- find 2 closest images
             i1, i2 = np.argsort(np.abs(x-cube['WL']))[:2]
             # -- linear interpolation
-            im = cube['image'][i1, :, :] + \
+            im = cube[k][i1, :, :] + \
                 (x-cube['WL'][i1])/(cube['WL'][i2]-cube['WL'][i1]) *\
-                (cube['image'][i2, :, :]-cube['image'][i1, :, :])
+                (cube[k][i2, :, :]-cube[k][i1, :, :])
 
             res[:, i] = visImage(im, cube['scale'], u, v, x)
     return res
@@ -875,7 +879,10 @@ def fluxCube(cube, wl):
         wl: wavelength vector in um (ignored if cube is 2D)
     wl: wavelength (vector, in um)
     """
-    tmp = np.sum(cube['image'], axis=(1, 2))
+    k = 'image'
+    if not k in cube:
+        k = 'cube'
+    tmp = np.sum(cube[k], axis=(1, 2))
     return np.interp(wl, cube['WL'], tmp)
 
 
@@ -886,18 +893,31 @@ def checkCubeShapes(cube, name='cube'):
         return False
 
     K = ['X', 'Y', 'image']
+    if 'cube' in cube:
+        K = ['X', 'Y', 'cube']
+
     if not all([k in cube for k in K]):
-        print(err+'"%s" should at least contain "X", "Y" and "image"' % name)
+        print(err+'"%s" should at least contain '%name+','.join(K))
         return False
 
-    if type(cube['image']) != np.ndarray:
-        print(err+'%s["image"] should be of type "np.ndarray"' % (name))
-        return False
+    if 'image' in cube:
+        if type(cube['image']) != np.ndarray:
+            print(err+'%s["image"] should be of type "np.ndarray"' % (name))
+            return False
 
-    if len(cube['image'].shape) == 2:
-        L = {'X': 2, 'Y': 2, 'image': 2}
+        if len(cube['image'].shape) == 2:
+            L = {'X': 2, 'Y': 2, 'image': 2}
+        else:
+            L = {'WL': 1, 'X': 2, 'Y': 2, 'image': 3}
     else:
-        L = {'WL': 1, 'X': 2, 'Y': 2, 'image': 3}
+        if type(cube['cube']) != np.ndarray:
+            print(err+'%s["cube"] should be of type "np.ndarray"' % (name))
+            return False
+
+        if len(cube['cube'].shape) == 2:
+            L = {'X': 2, 'Y': 2, 'cube': 2}
+        else:
+            L = {'WL': 1, 'X': 2, 'Y': 2, 'cube': 3}
 
     if not all([type(cube[k]) == np.ndarray for k in L]):
         print(err+'%s should be of type "np.ndarray"' %
@@ -921,17 +941,20 @@ def checkCubeShapes(cube, name='cube'):
                                                           name, str(cube['Y'].shape)))
         return False
 
-    if L['image'] == 2:
-        if cube['X'].shape != cube['image'].shape:
-            print(err+'"image" has wrong dimensions!')
-            print('  %s["X"].shape=%s != %s["image"].shape=%s' % (name, str(cube['X'].shape),
-                                                                  name, str(cube['image'].shape)))
+    k = 'image'
+    if not k in cube:
+        k = 'cube'
+    if L[k] == 2:
+        if cube['X'].shape != cube[k].shape:
+            print(err+''"image"' has wrong dimensions!')
+            print('  %s["X"].shape=%s != %s['"image"'].shape=%s' % (name, str(cube['X'].shape),
+                                                                  name, str(cube[k].shape)))
             return False
     else:
         _tup = tuple(list(cube['WL'].shape)+list(cube['X'].shape))
-        if cube['image'].shape != _tup:
-            print(err+'"image" has wrong dimensions!')
-            print('  %s["image"].shape = %s, should be %s' % (name, str(cube['image'].shape),
+        if cube[k].shape != _tup:
+            print(err+''"image"' has wrong dimensions!')
+            print('  %s['"image"'].shape = %s, should be %s' % (name, str(cube[k].shape),
                                                               str(_tup)))
             return False
 
@@ -940,11 +963,10 @@ def checkCubeShapes(cube, name='cube'):
 
 __mjd0 = 57000
 
-
 def makeFakeVLTI(t, target, lst, wl, mjd0=None, lst0=0,
                  diam=None, cube=None, noise=None, thres=None,
                  model=None, insname='synthetic', debug=False,
-                 doubleDL=False, wlKernel=None):
+                 doubleDL=False, wlKernel=None, setup={}):
     """
     for VLTI!
 
@@ -955,13 +977,14 @@ def makeFakeVLTI(t, target, lst, wl, mjd0=None, lst0=0,
     diam = UD diam, in mas. If set, returns simple UD model
     cube = {'image', 'scale', 'WL', 'spectrum'}
         image: Nx x Ny spatial pixels (x Nwl optional )
-        scale: "scale", in mas (ignoired)
+        scale: "scale", in mas (ignored)
         wl: wavelength vector in um (ignored if cube is 2D only)
         spectrum: spectrum (same lemgth as wl), should be sum(image, axis=(0,1))
     model = a dictionnary describing a model (usual PMOIRED syntax)
     doubleDL = use double passage delay line (default=False)
     noise = noise to apply. If ==0, no noise; if None, typical noise (relative / degrees):
           {'V2': 0.01, '|V|':0.01, 'PHI':1., 'FLUX':0.01, 'T3PHI':1., 'T3AMP':0.01}
+    setup = can contain {'smear', 'wl kernel'}, default is {}
     """
     global __mjd0
 
@@ -1020,6 +1043,9 @@ def makeFakeVLTI(t, target, lst, wl, mjd0=None, lst0=0,
         tmp['observable'] = tmp['observable'][tmp['observable']]
         # print(tmp)
 
+    # for k in tmp["u"]:
+    #     print(f'DBG> {k=}, {tmp["u"][k].shape=}')
+
     # -- fake MJD
     if mjd0 == None:
         # -- needed to simulate data taken at different dates
@@ -1038,7 +1064,17 @@ def makeFakeVLTI(t, target, lst, wl, mjd0=None, lst0=0,
            'baselines': tmp['baselines'],
            'TELLURICS': np.ones(len(wl)),
            'MJD': tmp['MJD'],
+           'fit':setup
            }
+    if len(wl)>1:
+        res['dWL'] = np.gradient(wl)*wk
+    else:
+        if not 'dWL' in setup:
+            print('please provide dWL (in microns) in setup')
+            return
+        res['dWL'] = setup['dWL']*wk
+
+ 
     # print('res:', res)
 
     # == complex visibility function
@@ -1049,9 +1085,12 @@ def makeFakeVLTI(t, target, lst, wl, mjd0=None, lst0=0,
     if not cube is None:
         if not checkCubeShapes(cube):
             raise Exception('data cube is ill formed')
-        if len(cube['image'].shape) == 2:
+        k = 'image'
+        if not k in cube:
+            k = 'cube'
+        if len(cube[k].shape) == 2:
             def fvis(u, v, l): return visImage(
-                cube['image'], cube['scale'], u, v, l)
+                cube[k], cube['scale'], u, v, l)
             def fflux(l): return np.ones((len(lst), len(l)))
         else:
             def fvis(u, v, l): return visCube(cube, u, v, l)
@@ -1060,7 +1099,7 @@ def makeFakeVLTI(t, target, lst, wl, mjd0=None, lst0=0,
                 def fflux(l): return np.interp(l, cube['WL'], cube['spectrum'])[None,:]*(1+0*lst[:,None])
             else:
                 def fflux(l): return np.interp(l, cube['WL'],
-                                               np.sum(cube['image'], axis=(1, 2)))[None,:]*(1+0*lst[:,None])
+                                               np.sum(cube[k], axis=(1, 2)))[None,:]*(1+0*lst[:,None])
         
     VIS = {}  # complex visibility
     # -- OI_VIS2
@@ -1085,6 +1124,7 @@ def makeFakeVLTI(t, target, lst, wl, mjd0=None, lst0=0,
                 'V2': np.abs(VIS[b])**2, #+nv2*np.random.randn(len(lst), len(wl)),
                 'EV2': np.zeros((len(lst), len(wl))),
                 }
+
         if debug:
             print(b, list(OIV2[b].keys()))
 
@@ -1209,6 +1249,7 @@ def makeFakeVLTI(t, target, lst, wl, mjd0=None, lst0=0,
     if cube is None:
         param = model
         res['fit'] = {'obs': ['V2', '|V|', 'T3PHI', 'T3AMP', 'PHI', 'FLUX']}
+        res['fit'] |= setup
         res = oimodels.VmodelOI(res, param, fullOutput=True)
 
         # -- wait what?!
@@ -1217,8 +1258,8 @@ def makeFakeVLTI(t, target, lst, wl, mjd0=None, lst0=0,
                 res['OI_VIS'][b][k] = tmp[k][b][:, None]+0*res['WL'][None, :]
             for b in res['OI_VIS2']:
                 res['OI_VIS2'][b][k] = tmp[k][b][:, None]+0*res['WL'][None, :]
+
     res['configurations per MJD'] = conf
-    res['dWL'] = np.gradient(res['WL'])*wk
 
     # -- set Noise levels
     if 'OI_FLUX' in res:
@@ -1253,6 +1294,7 @@ def makeFakeVLTI(t, target, lst, wl, mjd0=None, lst0=0,
 
     for k in res['OI_FLUX'].keys():
         addnoise('OI_FLUX', k, 'FLUX')
+        #addnoise('OI_FLUX', k, 'RFLUX')
     for k in res['OI_VIS'].keys():
         addnoise('OI_VIS', k, '|V|')
         addnoise('OI_VIS', k, 'PHI')

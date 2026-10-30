@@ -29,13 +29,23 @@ The principles are close to tools such as [LITpro](https://www.jmmc.fr/english/t
 
 ## Install
 
-### Install with pip
+*Note: starting in October 2026, the version number will be based on the release date "YY.MM.DD".*
 
-`PMOIRED` is regularly pushed to PyPI at [https://pypi.org/project/pmoired/](https://pypi.org/project/pmoired/) so you can install directly using `pip`, by typing:
+### Use [`pmrd.py`](pmrd.py) script
+
+The simplest way to use PMOIRED on MacOS / Linux, with python3 and git installed (requires about 1G of disk space): 
 
 ```
-pip3 install pmoired
+wget https://raw.githubusercontent.com/amerand/PMOIRED/refs/heads/master/pmrd.py
+chmod +x pmrd.py
+./pmrd.py --install
 ```
+which will install `PMOIRED` from this repository in the environment located in `~/.pmrd`.
+
+Then, you can start a python console, ipython, notebook or jupyter-lab by typing `./pmrd -p`, `./pmrd -i`, `./pmrd -n` or `./pmrd -j` respectively. Run the [examples](https://github.com/amerand/PMOIRED_examples) by typing `./pmrd.py -e`
+
+You can update `PMOIRED` from github with `./pmrd.py -u`. Removing the environment is achieved with `./python pmrd.py --remove`.
+
 ### Install with git
 
 The Github version is the most up-to-date. To install from the github repository directly:
@@ -49,15 +59,15 @@ cd PMOIRED
 pip3 install .
 ``` 
 
-### Install in an environment and run the [model definition notebook](https://nbviewer.org/github/amerand/PMOIRED/blob/master/pmoired/Model%20definitions%20and%20examples.ipynb)
+### Install with pip
+
+`PMOIRED` is regularly pushed to PyPI at [https://pypi.org/project/pmoired/](https://pypi.org/project/pmoired/) so you can install directly using `pip`, by typing:
 
 ```
-python3 -m venv _pmoired
-source _pmoired/bin/activate
-pip3 install git+https://github.com/amerand/PMOIRED jupyterlab
-jupyter-lab _pmoired/lib/python*/site-packages/pmoired/Model\ definitions\ and\ examples.ipynb
-deactivate
+pip3 install pmoired
 ```
+
+Note that the pip version is not updated as often, and to get the latests features and bug fix, it is recommended to use the git version, or better yet, [`pmrd.py`](pmrd.py) (see above).
 
 ### Uninstall
 To uninstall (works for both PyPI and github versions):
@@ -65,17 +75,31 @@ To uninstall (works for both PyPI and github versions):
 pip3 uninstall pmoired
 ```
 
+if you use [`pmrd.py`](pmrd.py), the following will remove the whole environment:
+```
+python pmrd.py --remove
+```
+
 ## Examples and tutorials
 
-This repository comes with a [Jupyter Notebook showing basic model syntax](https://nbviewer.org/github/amerand/PMOIRED/blob/master/pmoired/Model%20definitions%20and%20examples.ipynb).
+This repository comes with a [Jupyter Notebook showing basic model syntax](https://nbviewer.org/github/amerand/PMOIRED/blob/master/pmoired/Model%20definitions%20and%20examples.ipynb). You can call this page from Python:
+```
+>>> import pmoired
+>>> pmoired.modelsDefinitions()
+```
 
 Full examples, how to load real data and analyse them, are available in a separate repository: [PMOIRED_examples](https://github.com/amerand/PMOIRED_examples). These examples are Jupyter Notebooks reproducing published results with other tools, and serve both as tutorials and verification of `PMOIRED`. They cover most of the features of `PMOIRED`, from the basics to more advanced operations.
+
+You can also check the following material:
+- Tutorial from the [2024 VLTI School](https://vltischool2024.sciencesconf.org/?lang=en): [modelling of GRAVITY observations of the Herbig Ae star HD 58647](https://github.com/amerand/PMOIRED_VLTI2024): in the continuum and in the Brackett gamma Hydrogen line.
+- [Binary fit tutorial](https://github.com/robert-klement/PMOIRED_tutorial_binary_fitting) from Robert Klement, for the 2026 CHARA Days
+
 
 ## Using and quoting `PMOIRED`
 
 References to `PMOIRED` should point to the [2022 SPIE Telescopes+Instrumentation conference proceeding paper](https://ui.adsabs.harvard.edu/abs/2022SPIE12183E..1NM/abstract).
 
-This code is a __research project in continuous development__ and not yet properly fully documented. If you want to get the best analysis for your data, do not hesitate to contact me: I try to be responsive, in particular with junior scientists. New features are driven by collaborations: if you think  `PMOIRED` is missing something, definitely contact me!
+This code is a __research project in continuous development__ and not properly fully documented. If you want to get the best analysis for your data, do not hesitate to contact me: I try to be responsive, in particular with junior scientists. New features are driven by collaborations: if you think  `PMOIRED` is missing something, definitely contact me!
 
 I maintain a list of works published using `PMOIRED` in a [curated bibliography](https://ui.adsabs.harvard.edu/public-libraries/dz7RG915Swq5yAB1KwmgTA).
 
@@ -109,6 +133,13 @@ The latest version of `PMOIRED` has been tested on:
 - jupyterlab 4.4.1
 
 ## Acknowledgments
+
+- `PMOIRED` uses extensively [Numpy](https://numpy.org/), [Scipy](https://scipy.org), [Matplotlib](https://matplotlib.org/), [Astropy](https://www.astropy.org/) and [Astroquery](https://github.com/astropy/astroquery). It is optimised to be used with [Jupyter](https://jupyter.org/) notebooks.
+- Telluric corrections use HITRANS models computed by A. Smette (private comm.), similar to those used for [MOLECFIT](https://ui.adsabs.harvard.edu/abs/2015A%26A...576A..77S/abstract)
+- The Keplerian disk model is adapted from [Delaa+2011](https://ui.adsabs.harvard.edu/abs/2011A%26A...529A..87D/abstract) and [Meilland+2012](https://ui.adsabs.harvard.edu/abs/2012A%26A...538A.110M/abstract)
+- The rotating star model is adapted from [Aufdenberg+2006](https://ui.adsabs.harvard.edu/abs/2006ApJ...645..664A/abstract)
+- The spherical ATLAS models used for center-to-limb darkening have been computed by Neilson and Lester (2013), for [red giants](https://www.aanda.org/articles/aa/full_html/2013/06/aa21502-13/aa21502-13.html) and [FGK dwarfs](https://www.aanda.org/articles/aa/full_html/2013/08/aa21888-13/aa21888-13.html)
+- The [JSDC](https://jmmc.osug.fr/english/tools/data-bases/jsdc-72/) is used for calibrators' angular diameters
 
 `PMOIRED` has received contributions from Akke Corporaal, Evgenia Koumpia and Robert Klement.
 

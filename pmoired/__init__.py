@@ -1,6 +1,6 @@
-from pmoired import oimodels, oifits, dpfit, oicorr, oifake
-
 import multiprocessing
+
+from pmoired import dpfit, oicorr, oifake, oifits, oimodels
 
 try:
     # -- see https://stackoverflow.com/questions/64174552
@@ -8,24 +8,31 @@ try:
 except:
     pass
 
-import sys, os, platform
+import os
 import pickle
+import platform
+import sys
 import time
 from inspect import signature
 
-import numpy as np
+import astropy
+import astroquery
+from astroquery.vizier import Vizier
 
 # import warnings
 # warnings.filterwarnings("ignore", category=RuntimeWarning)
 import matplotlib
 import matplotlib.pyplot as plt
-
+import numpy as np
 import scipy
-import astropy
-import astroquery
-import matplotlib
 
-__version__ = "1.3.11"
+try:
+    # Necessary while Python versions below 3.9 are supported.
+    import importlib_resources as resources
+except ImportError:
+    from importlib import resources
+
+__version__ = "26.10.28" # using release date
 
 FIG_MAX_WIDTH = 9.5
 FIG_MAX_HEIGHT = 6
@@ -33,11 +40,9 @@ MAX_THREADS = multiprocessing.cpu_count()
 US_SPELLING = False
 oimodels.US_SPELLING = US_SPELLING
 
-
 def setUSspelling(b):
     US_SPELLING = b
     oimodels.US_SPELLING = US_SPELLING
-
 
 def _customPlots(b):
     if b:
@@ -47,9 +52,11 @@ def _customPlots(b):
     else:
         matplotlib.rc_file_defaults()
 
-
-if os.getlogin() == "amerand" and platform.uname().node == "MDVH47TQ2XR":
-    _customPlots(True)
+try:
+    if os.getlogin() == "amerand" and platform.uname().node == "MDVH47TQ2XR":
+        _customPlots(True)
+except:
+    pass
 
 __versions__ = {
     "pmoired": __version__,
@@ -60,15 +67,18 @@ __versions__ = {
     "astroquery": astroquery.__version__,
     "matplotlib": matplotlib.__version__,
 }
+_aknowledge = {'JSDC':True, 'PMOIRED':True}
 
-# not required for the core module
-# try:
-#     jup = os.popen('jupyter --version').readlines()
-#     for j in jup:
-#         __versions__[j.split(':')[0].strip()] = j.split(':')[1].split('\n')[0].strip()
-# except:
-#     # -- cannot get versions of jupyter tools
-#     pass
+# -- not required for the core module, but could be good to debug
+try:
+    jup = os.popen('jupyter --version').readlines()
+    for j in jup:
+        if ':' in j:
+            __versions__[j.split(':')[0].strip()] = j.split(':')[1].split('\n')[0].strip()
+except:
+    # -- cannot get versions of jupyter tools
+    pass
+
 
 def _isiterable(x):
     res = True
@@ -77,6 +87,16 @@ def _isiterable(x):
     except:
         res = False
     return res
+
+def modelsDefinitions():
+    modelDefFile = r'Model definitions and examples.html'
+    r = resources.files("pmoired").joinpath(modelDefFile)
+    if os.path.exists(r):
+        print(str(r).replace('.html', '.ipynb'))
+        os.system('open '+str(r).replace(' ', r'\ '))
+    else:
+        print(str(r), 'cannot be found')
+    return 
 
 class OI:
     def __init__(
@@ -125,9 +145,17 @@ class OI:
 
         See Also: addData, load, save
         """
+        if _aknowledge['PMOIRED']:
+            print('\033[97m-- Please aknowledge the use of PMOIRED', '-'*11)
+            print(r'https://github.com/amerand/PMOIRED#using-and-quoting-pmoired')
+            print('-'*51, '\033[0m')
+            _aknowledge['PMOIRED'] = False
+
         self.debug = debug
         # -- last best fit to the data
         self.bestfit = {}
+        self._basemodel = {}
+        self._inject = {}
         # -- bootstrap results:
         self.boot = None
         # -- grid / random fits:
@@ -177,6 +205,7 @@ class OI:
         self._bootAxes = {}
         self._gridFig = None
         self._gridAxes = {}
+        self.limgrid = []
 
     def __del__(self):
         """not doing anything"""
@@ -217,7 +246,7 @@ class OI:
 
         with open(name, "wb") as f:
             data = {k: self.__dict__[k] for k in ext}
-            #print('data.keys():', data.keys())
+            # print('data.keys():', data.keys())
             if type(data["bestfit"]) == dict and "func" in data["bestfit"]:
                 data["bestfit"]["func"] = None  # avoid potential problems...
                 data["bestfit"]["x"] = None  # takes too much space
@@ -270,7 +299,7 @@ class OI:
                 self.__dict__[k] = data[k]
                 loaded.append(k)
             except:
-                print('warning! could not load extension', k)
+                print("warning! could not load extension", k)
                 pass
         if debug:
             print("loaded:", loaded)
@@ -458,14 +487,198 @@ class OI:
                 GR.append((INS.index(p1), INS.index(p2)))
         return GR
 
+    def computeIsoplanetism(self, verbose=False, H=10.0):
+        """
+        H: height of turbulence, in km
+
+        assumes ESO VLTI header
+
+        https://www.aanda.org/articles/aa/pdf/2022/09/aa43941-22.pdf
+        """
+        # == isoplanetic angle
+        seeing_500nm = np.array([0.5*(d['header']['ESO ISS AMBI FWHM START']+
+                                      d['header']['ESO ISS AMBI FWHM END']) for d in self.data])
+        r0_500nm = 0.98*0.5e-6/(seeing_500nm*np.pi/180/3600)
+        alt = np.array([d['header']['ESO ISS ALT'] for d in self.data])
+        theta0_500nm = 0.314*np.cos((90-alt)*np.pi/180)*r0_500nm/(1000*H)
+        theta0_500nm *= 180*3600/np.pi
+        # if verbose:
+        #     print(f'{seeing_500nm=} arcsec')
+        #     print(f'{r0_500nm=} m')
+        #     print(f'{theta0_500nm=} arcsec')
+        for i in range(len(self.data)):
+            self.data[i]['TURB'] = {}
+            self.data[i]['TURB']['seeing_500nm'] = seeing_500nm[i]
+            self.data[i]['TURB']['theta0_500nm'] = theta0_500nm[i]
+            self.data[i]['TURB']['R0'] = r0_500nm[i]*(self.data[i]['WL']/0.5)**(6/5)
+            self.data[i]['TURB']['THETA0'] = theta0_500nm[i]*(self.data[i]['WL']/0.5)**(6/5)
+
+        deg2hms = lambda x: '%02d:%02d:%06.3f'%(int(x/15), 
+                                        int(60*(x/15-int(x/15))), 
+                                        60*(x*4-int(x*4)))
+
+        deg2dms = lambda x: '%s%02d:%02d:%06.3f'%('-' if x<0 else '+', 
+                                                  int(np.abs(x)), 
+                                                  int(60*(np.abs(x)-int(np.abs(x)))), 
+                                                  60*(np.abs(x*60)-int(np.abs(x*60))))
+
+        num2dotted = lambda s: '.'.join([':'.join([s.split('.')[0][:-4], s.split('.')[0][-4:-2], s.split('.')[0][-2:]]), s.split('.')[1]])
+        hms2deg = lambda x: 15*np.sum(np.float64(x.split(':'))*np.array([1,1/60,1/3600]))
+        dms2deg = lambda x: np.sum(np.abs(np.float64(x.split(':')))*np.array([1,1/60,1/3600]))*(-1 if x.strip()[0]=='-' else 1)
+
+        Cs = np.zeros(2)
+
+        for i,d in enumerate(self.data):
+            ra1 = hms2deg(num2dotted(d['header']['ESO INS SOBJ ALPHA']))
+            ra2 = hms2deg(num2dotted(d['header']['ESO FT ROBJ ALPHA']))
+            dec1 = dms2deg(num2dotted(d['header']['ESO INS SOBJ DELTA']))
+            dec2 = dms2deg(num2dotted(d['header']['ESO FT ROBJ DELTA']))
+            dRA  = (ra1 - ra2)*np.cos(0.5*(dec1+dec2)*np.pi/180)
+            dDEC = dec1 - dec2
+            self.data[i]['TURB']['FT-SC'] = 3600*np.sqrt(dRA**2 + dDEC**2)
+            # -- assumes no AT+UT combination shenanigans here:
+            if any(['U' in b for b in d['baselines']]):
+                D = 8.2
+            else:
+                D = 1.8
+            sigmap = 0.12*np.pi**(1/3)*self.data[i]['WL']*\
+                (D/self.data[i]['TURB']['R0'])**(-1/6)*\
+                self.data[i]['TURB']['FT-SC']/self.data[i]['TURB']['THETA0']
+            self.data[i]['TURB']['VLOSS'] = np.exp(-2*np.pi**2/self.data[i]['WL']**2*sigmap**2)
+            if verbose:
+                c = np.polyfit(self.data[i]['WL']-np.mean(self.data[i]['WL']), self.data[i]['TURB']['VLOSS'], 1)
+                #print(f"<Vloss> data[{i}]: {np.mean(self.data[i]['TURB']['VLOSS']):.3f}")
+                print(f"<Vloss> data[{i}] 1*={c[0]:.3f}, 0*={c[1]:.3f}")
+                Cs += c
+        Cs /= len(self.data)
+        if verbose:
+            print(f"<Vloss> all data 1*={Cs[0]:.3f}, 0*={Cs[1]:.3f}")
+        
+        return 
+
+    def isoplanetismTf(self, obs=None, plot=False, Hturb='Hturb', forB=None):
+        """
+        computes an isoplanetic transfer function based on the info in the header 
+        of the data (seeing, altitude, FT-SC separation) and Marechal approximation.
+
+        see https://www.aanda.org/articles/aa/pdf/2022/09/aa43941-22.pdf
+
+        will return a TF for |V|, V2, or both (depending of obs from setupFit),
+        parametrised usinf the height of turbulence in km, as "Hturb" (you can 
+        change the name of the variable).
+
+        -- how to use it?
+
+        # define your model and add the TF
+
+        oi.setupFit(...)
+        m = {'ud':3.14}
+        m |= oi.getTfParameters()
+        m |= oi.isoplanetismTf()
+        
+        # then:
+
+        m = {'ud':                  3.14,
+             '#TF_T3PHI_J2G1A0_+0': 0.01,
+             'Hturb':               4.417, 
+             '#TF_|V|_G1A0_*0':     '0.996*np.exp(-$Hturb**2/4.417**2)',
+             '#TF_|V|_G1A0_*1':     '$Hturb**2.000*0.046*np.exp(-$Hturb**2/4.401**2)',
+             '#TF_|V|_J2A0_*0':     '0.996*np.exp(-$Hturb**2/4.417**2)',
+             '#TF_|V|_J2A0_*1':     '$Hturb**2.000*0.046*np.exp(-$Hturb**2/4.401**2)',
+             '#TF_|V|_J2G1_*0':     '0.996*np.exp(-$Hturb**2/4.417**2)',
+             '#TF_|V|_J2G1_*1':     '$Hturb**2.000*0.046*np.exp(-$Hturb**2/4.401**2)',
+            }
+
+        see also: getTfParameters, computeIsoplanetism
+        """
+        gauss = lambda x, p: x**p['pow']*p['amp']*np.exp(-x**2/p['sigma']**2)
+        sgauss = lambda x, p: (f"{x}**{p['pow']:.3f}*" if p['pow']!=0 else '') + \
+                    f"{p['amp']:.3f}*np.exp(-{x}**2/{p['sigma']:.3f}**2)"
+        # -- guess the 
+        if obs is None:
+            obs = []
+            Bv2, Bv = [], []
+            for d in self.data:
+                if 'fit' in d and 'obs' in d['fit']:
+                    if 'V2' in d['fit']['obs']:
+                        obs.append('V2')
+                        Bv2.extend(d['baselines'])
+                    if '|V|' in d['fit']['obs']:
+                        obs.append('|V|')
+                        Bv.extend(d['baselines'])
+                else:
+                    raise Exception("run setupFit before, or specify obs='V2' or obs='|V|'")
+            obs = list(set(obs))
+            Bv2 = list(set(Bv2))
+            Bv = list(set(Bv))
+            
+            if len(obs)==2:
+                return self.isoplanetismTF(obs='V2', Hturb=Hturb, forB=Bv2) | \
+                       self.isoplanetismTF(obs='|V|', Hturb=Hturb, forB=Bv)
+            else:
+                obs = obs[0]
+                forB = Bv2 if obs=='V2' else Bv
+
+        H = np.linspace(1, 12, 20)
+        C = []
+        if forB is None:
+            B = []
+        for h in H:
+            self.computeIsoplanetism(H=h)
+            _C = []
+            for d in self.data:
+                if obs == 'V2':
+                    c = np.polyfit(d['WL']-np.mean(d['WL']), d['TURB']['VLOSS']**2, 1)
+                    for k in d['OI_VIS2']:
+                        if forB is None and not k in B:
+                            B.append(k)
+                elif obs == '|V|':
+                    c = np.polyfit(d['WL']-np.mean(d['WL']), d['TURB']['VLOSS'], 1)
+                    for k in d['OI_VIS']:
+                        if forB is None and not k in B:
+                            B.append(k)
+                else:
+                    raise Exception('obs should be "V2" or "|V|"')
+                _C.append(c)
+            C.append(np.mean(_C, axis=0))
+        if not forB is None:
+            B = forB
+
+        C = np.array(C)
+        fit0 = dpfit.leastsqFit(gauss, H, {'amp':1, 'sigma':5, 'pow':2}, C[:,0], 
+                                        #doNotFit=['pow'], 
+                                        verbose=0) 
+        TF = {Hturb: float(fit0['best']['sigma'])}
+        #print(sgauss('$Hturb', fit0['best']))
+        TF |= {'#TF_'+obs+'_'+k+'_*1':sgauss('$'+Hturb, fit0['best']) for k in B}
+        fit1 = dpfit.leastsqFit(gauss, H, {'amp':1, 'sigma':4, 'pow':0}, C[:,1], 
+                                        doNotFit=['pow'], verbose=0)
+        #print(sgauss('$Hturb', fit['best']))
+        TF |= {'#TF_'+obs+'_'+k+'_*0':sgauss('$'+Hturb, fit1['best']) for k in B}
+
+        if plot:
+            if not type(plot)==int:
+                plot = self.fig
+                self.fig+=1
+            plt.close(plot)
+            plt.figure(plot)
+            plt.plot(H, C[:,0], 'ob', label='1*')
+            plt.plot(H, fit0['model'], ':b')    
+            plt.plot(H, C[:,1], 'sr', label='0*')
+            plt.plot(H, fit1['model'], ':r')
+            plt.legend()
+            plt.xlabel('turbulence altitude')
+            plt.ylabel('parameters')
+        
+        return TF
+    
     def fromTemplate(self, oi, model):
         self.data = oimodels.VmodelOI(oi.data, model, asTemplate=True)
-        E = ['fit', 'configurations per MJD', 'LST', 'dWL', 'header', 'units']
-        for i,d in enumerate(self.data):
+        E = ["fit", "configurations per MJD", "LST", "dWL", "header", "units"]
+        for i, d in enumerate(self.data):
             for e in E:
                 if e in oi.data[i]:
                     d[e] = oi.data[i][e]
-
         return
 
     def avgGravityPola(self, info=False):
@@ -536,21 +749,12 @@ class OI:
             f1n2 = np.logical_and(f1, ~f2)
             # -- weighted average where data are common
             self.data[i1]["OI_VIS2"][k]["V2"][~f12] = (
-                self.data[i1]["OI_VIS2"][k]["V2"][~f12]
-                / self.data[i1]["OI_VIS2"][k]["EV2"][~f12]
-                + self.data[i2]["OI_VIS2"][k]["V2"][~f12]
-                / self.data[i2]["OI_VIS2"][k]["EV2"][~f12]
-            ) / (
-                1 / self.data[i1]["OI_VIS2"][k]["EV2"][~f12]
-                + 1 / self.data[i2]["OI_VIS2"][k]["EV2"][~f12]
+                self.data[i1]["OI_VIS2"][k]["V2"][~f12]/self.data[i1]["OI_VIS2"][k]["EV2"][~f12]
+                + self.data[i2]["OI_VIS2"][k]["V2"][~f12]/self.data[i2]["OI_VIS2"][k]["EV2"][~f12]
+            ) / (1/self.data[i1]["OI_VIS2"][k]["EV2"][~f12] + 1/self.data[i2]["OI_VIS2"][k]["EV2"][~f12]
             )
             self.data[i1]["OI_VIS2"][k]["EV2"][~f12] = (
-                1
-                / (
-                    1 / self.data[i1]["OI_VIS2"][k]["EV2"][~f12] ** 2
-                    + 1 / self.data[i2]["OI_VIS2"][k]["EV2"][~f12] ** 2
-                )
-                ** 0.5
+                1/(1/self.data[i1]["OI_VIS2"][k]["EV2"][~f12]**2 + 1/self.data[i2]["OI_VIS2"][k]["EV2"][~f12]**2)**0.5
             )
             # -- data valid in 2 but not in 1
             self.data[i1]["OI_VIS2"][k]["V2"][f1n2] = self.data[i2]["OI_VIS2"][k]["V2"][
@@ -680,16 +884,16 @@ class OI:
         self.data.pop(i2)
         return
 
-    def getTfParameters(self, obs=None, withVSlope=False):
-        return _getTfParamsOI(self.data, obs=obs, withVSlope=withVSlope)
+    def getTfParameters(self, order=None, obs=None,):
+        return _getTfParamsOI(self.data, obs=obs, order=order)
 
     def getESOPipelineParams(self, verbose=True):
         for i, d in enumerate(self.data):
             if "header" in d:
-                print("\033[5m=", d["filename"], "=" * 20, "\033[0m")
+                if verbose:
+                    print("\033[5m=", d["filename"], "=" * 20, "\033[0m")
                 self.data[i]["recipes"] = oifits.getESOPipelineParams(
-                    d["header"], verbose=verbose
-                )
+                    d["header"], verbose=verbose)
         return
 
     def setSED(self, wl, sed, err=0.01, unit=None):
@@ -747,13 +951,15 @@ class OI:
                     self.data[i]["units"] = {"FLUX": unit}
         return
 
-    def setupFit(self, fit, update=False, debug=False, insname=None):
+    def setupFit(self, fit, update=False, debug=False, insname=None, auto=True):
         """
         set fit parameters by giving a dictionnary (or a list of dict, same length
         as 'data'):
 
         insname: only apply to this insname (default: None -> apply to all).
             Can be a string (single insname) or list of insnames.
+
+        auto: will try to apply some sensible rules (only of 'wl kernel' currently)
 
         "fit" contains the following keys (only "obs" is mandatory):
 
@@ -775,6 +981,11 @@ class OI:
         -> by default, the full defined range is fitted.
 
         'baseline ranges': gives a list of baselines ranges (in m) where to fit.
+            e.g. [(10, 20), (40, 100)] it will not override flagged data
+            it will affect bose baselines AND triangles if any baseline if out of range(s)
+        -> by default, the full defined range is fitted.
+
+        'spatial frequency ranges': gives a list of spatial freq ranges (in m/um) where to fit.
             e.g. [(10, 20), (40, 100)] it will not override flagged data
             it will affect bose baselines AND triangles if any baseline if out of range(s)
         -> by default, the full defined range is fitted.
@@ -870,7 +1081,7 @@ class OI:
         if debug:
             print("fit>obs:", [d["fit"]["obs"] for d in self.data])
 
-        for d in self.data:
+        for i,d in enumerate(self.data):
             if "fit" in d and "obs" in d["fit"]:
                 if debug:
                     print(
@@ -878,6 +1089,27 @@ class OI:
                         list(filter(lambda x: x.startswith("OI_"), d.keys())),
                     )
                 d["fit"]["obs"] = _checkObs(d, d["fit"]["obs"]).copy()
+
+                if auto:
+                    if not 'wl kernel' in d["fit"] and len(d['WL'])>1:
+                        R = np.mean(d['WL']/d['dWL'])
+                        P = np.mean(d['WL']/np.gradient(d['WL']))
+                        wlk = round(P/R, 1)
+                        if 'MATISSE' in insname and wlk<4:
+                            if np.mean(d['WL'])<7:
+                                wlk = 5
+                            else:
+                                wlk = 7
+                            print(f"setupFit> {i}/{d['insname']}: setting 'wl kernel':{wlk} according to "+
+                                'https://www.eso.org/sci/facilities/paranal/instruments/matisse/inst.html')   
+                        elif 'GRAVITY' in insname and np.abs(wlk-1.5)>.5:
+                            wlk = 2          
+                            print(f"setupFit> {i}/{d['insname']}: setting 'wl kernel':{wlk} according to "+
+                                'expected value')
+                        else:
+                            print(f"setupFit> {i}/{d['insname']}: setting 'wl kernel':{wlk} according to WL definition")
+                        d["fit"]["wl kernel"] = wlk
+
                 if debug:
                     print("fit>obs:", d["fit"]["obs"])
         return
@@ -921,6 +1153,8 @@ class OI:
         factor=100,
         _zeroCorrelations=False,
         _maxRho=1,
+        inject=None, truth=None, fitInject=True,
+        saveBest=True,
     ):
         """
         model: a dictionnary describing the model
@@ -929,6 +1163,8 @@ class OI:
         maxfev: maximum number of iterations
         ftol: chi2 stopping criteria
         follow: list of parameters to display as fit is going on
+        inject: inject features and will fit to
+            "data - V(model) + V(model|inject)"
 
         prior: list of priors as tuples. For example
             [('a+b', '=', 1.2, 0.1)] if a and b are parameters. a+b = 1.2 +- 0.1
@@ -970,16 +1206,26 @@ class OI:
             if not _checkPrior(prior):
                 raise Exception('ill formed "prior"')
 
+        remem = {}
         if model is None:
+            if type(doNotFit) is list:
+                remem["doNotFit"] = doNotFit.copy()
+            if type(fitOnly) is list:
+                remem["fitOnly"] = fitOnly.copy()
+            if type(prior) is list:
+                remem["prior"] = prior.copy()
+            remem["uncer"] = self.bestfit["uncer"]
             try:
                 model = self.bestfit["best"]
                 if doNotFit == "auto":
                     doNotFit = self.bestfit["doNotFit"]
                     fitOnly = self.bestfit["fitOnly"]
+                if prior is None and prior in self.bestfit:
+                    prior = self.bestfit["prior"]
             except:
                 # assert True, ' first guess as "model={...}" should be provided'
                 raise Exception(' first guess as "model={...}" should be provided')
-
+        # print('remem:', remem)
         if doNotFit == "auto":
             doNotFit = []
 
@@ -987,10 +1233,35 @@ class OI:
         self._merged = oifits.mergeOI(
             self.data, collapse=True, verbose=False, dMJD=self.dMJD
         )
-        prior = self._setPrior(model, prior, autoPrior)
+        self._basemodel = model.copy()
+        self._inject = {}
+        firstGuess = model.copy()
+        if not inject is None:
+            if not truth is None:
+                self._basemodel = truth.copy() 
+            else:
+                self._basemodel = model.copy()
+            self._merged = oimodels._injectFeatures(self._merged, self._basemodel, inject)
+            self._inject = inject.copy()
+            # -- add inject to fitted parameters
+            if fitInject:
+                firstGuess = model | inject
+
+            if "doNotFit" in remem and not remem["doNotFit"] is None:
+                doNotFit = remem["doNotFit"]
+            if "fitOnly" in remem and not remem["fitOnly"] is None:
+                fitOnly = remem["fitOnly"]
+            if "prior" in remem and not remem["prior"] is None:
+                fitOnly = remem["prior"]
+            if "uncer" in remem:
+                for k in remem["uncer"]:
+                    if remem["uncer"][k] > 0:
+                        firstGuess[k] += 1 * np.random.randn() * remem["uncer"][k]
+
+        prior = self._setPrior(firstGuess, prior, autoPrior)
         if correlations:
             # -- this is going to be very slow for bootstrapping :(
-            _tmp = oimodels.residualsOI(self._merged, model, fullOutput=True, what=True)
+            _tmp = oimodels.residualsOI(self._merged, firstGuess, fullOutput=True, what=True)
             self._correlations = oicorr.corrSpectra(_tmp)
 
             # -- check if correlations levels were given by user
@@ -1027,9 +1298,9 @@ class OI:
         else:
             self._correlations = None
 
-        self.bestfit = oimodels.fitOI(
+        tmp = oimodels.fitOI(
             self._merged,
-            model,
+            firstGuess,
             fitOnly=fitOnly,
             doNotFit=doNotFit,
             verbose=verbose,
@@ -1041,10 +1312,16 @@ class OI:
             prior=prior,
             correlations=self._correlations,
         )
+
+        if saveBest:
+            self.bestfit = tmp
+        else:
+            return tmp
+
         if verbose:
             if len(self.bestfit["not significant"]):
                 print(
-                    "\033[31mWARNING: thiese parameters do not change the chi2!:",
+                    "\033[31mWARNING: these parameters do not change the chi2!:",
                     end=" ",
                 )
                 print(self.bestfit["not significant"], "\033[0m")
@@ -1074,10 +1351,13 @@ class OI:
         # -- priors are added as data
         self.bestfit["ndof"] -= len(prior)
         self.bestfit["prior"] = prior
-        # -- compute final model
+        # -- compute final data's model
         self._model = oimodels.VmodelOI(self._merged, self.bestfit["best"])
         self.computeModelSpectra(uncer=False)
         return
+
+    def injectFit(self, inject, **kwargs):
+        pass
 
     def _chi2FromModel(
         self,
@@ -1088,6 +1368,7 @@ class OI:
         ndof=None,
         nfit=None,
         debug=False,
+        inject=None,
     ):
         """
         WARNING: does not take into correlations!
@@ -1115,6 +1396,9 @@ class OI:
         self._merged = oifits.mergeOI(
             self.data, collapse=True, verbose=False, dMJD=self.dMJD
         )
+        if not inject is None:
+            self._merged = oimodels._injectFeatures(self._merged, model, inject)
+            
         prior += self._setPrior(model, prior, autoPrior)
 
         # -- warning: "correlations"" is global (i.e. applies to all data)!
@@ -1247,6 +1531,8 @@ class OI:
         multi=True,
         prior=None,
         constrain=None,
+        append=False,
+        verbose=2
     ):
         """
         check the detection limit for parameter "param" from "model" (default
@@ -1272,7 +1558,7 @@ class OI:
 
         self._merged = oifits.mergeOI(self.data, collapse=True, verbose=False)
         oimodels.MAX_THREADS = MAX_THREADS
-        self.limgrid = oimodels.gridFitOI(
+        tmp = oimodels.gridFitOI(
             self._merged,
             model,
             expl,
@@ -1282,7 +1568,13 @@ class OI:
             dLimSigma=nsigma,
             prior=prior,
             constrain=constrain,
+            verbose=verbose
         )
+        if append :
+            self.limgrid += tmp
+        else:
+            self.limgrid = tmp
+
         # self.limgrid = [{'best':g} for g in self.limgrid]
         self._limexpl = expl
         self._limexpl["param"] = param
@@ -1302,6 +1594,7 @@ class OI:
         x0=None,
         y0=None,
         radProfile=True,
+        logRad=False,
     ):
         """
         show the results from `detectionLimit` as 2D coloured map.
@@ -1341,9 +1634,11 @@ class OI:
         ):
             aspect = "equal"
             xy = True
+        else:
+            aspect='auto'
 
         self.fig += 1
-        plt.close(self.fig)
+        oimodels.closefig(self.fig)
         if xy and radProfile:
             plt.figure(self.fig, figsize=(FIG_MAX_WIDTH, FIG_MAX_WIDTH / 3))
             ax1 = plt.subplot(131, aspect=aspect)
@@ -1414,6 +1709,8 @@ class OI:
         if xy and radProfile:
             # -- radial detection limit
             ax3 = plt.subplot(133)
+            if logRad:
+                ax3.set_xscale('log')
             if x0 is None:
                 _x0 = lambda z: 0
             elif type(x0) == str:
@@ -1436,19 +1733,23 @@ class OI:
             else:  # assume number
                 _y0 = lambda z: y0
 
-            R = np.array(
-                [
-                    np.sqrt((x[px] - _x0(x)) ** 2 + (x[py] - _y0(x)) ** 2)
-                    for x in self.limgrid
-                ]
-            )
-            r = np.linspace(min(R), max(R), int(np.sqrt(len(self.limgrid))))
+            R = np.array([np.sqrt((x[px] - _x0(x)) ** 2 + 
+                                  (x[py] - _y0(x)) ** 2)
+                          for x in self.limgrid])
+
+            if logRad:
+                r = np.logspace(np.log10(min(R)), np.log10(max(R)), 
+                                int(np.sqrt(len(self.limgrid))))
+            else:
+                r = np.linspace(min(R), max(R), int(np.sqrt(len(self.limgrid))))
+
             plt.plot(R, c, ".k", alpha=0.2)
             _r, _f = [], []
             for i in range(len(r) - 1):
                 w = (R >= r[i]) * (R <= r[i + 1])
                 if sum(w):
-                    _r.append(0.5 * (r[i] + r[i + 1]))
+                    #_r.append(0.5 * (r[i] + r[i + 1]))
+                    _r.append(np.mean(R[w]))
                     _f.append(np.median(c[w]))
             plt.plot(_r, _f, "-r", linewidth=5, alpha=0.5)
             plt.xlabel("radial distance (mas)")
@@ -1456,7 +1757,7 @@ class OI:
             if mag:
                 ax3.invert_yaxis()
             plt.title("radial detection limit")
-
+            self.detLimRadProfile = {'r':_r, 'lim':_f}
         try:
             plt.tight_layout()
         except:
@@ -1479,6 +1780,9 @@ class OI:
         constrain=None,
         verbose=2,
         deltaChi2=None,
+        inject=None,
+        truth=None,
+        fitInject=True,
     ):
         """
         perform "Nfits" fit on data, starting from "model" (default last best fit),
@@ -1559,10 +1863,27 @@ class OI:
         self._merged = oifits.mergeOI(
             self.data, collapse=True, verbose=False, dMJD=self.dMJD
         )
-        prior = self._setPrior(model, prior, autoPrior)
+
+        self._inject = {}
+        firstGuess = model.copy()
+
+        if not inject is None:
+            if not truth is None:
+                self._basemodel = truth.copy() 
+            else:
+                self._basemodel = model.copy()
+            self._inject = inject.copy()
+
+            self._merged = oimodels._injectFeatures(self._merged, self._basemodel, self._inject)
+
+            # -- add inject to fitted parameters
+            if fitInject:
+                firstGuess = model | inject
+
+        prior = self._setPrior(firstGuess, prior, autoPrior)
         if correlations:
             # -- this is going to be very slow for bootstrapping :(
-            _tmp = oimodels.residualsOI(self._merged, model, fullOutput=True, what=True)
+            _tmp = oimodels.residualsOI(self._merged, firstGuess, fullOutput=True, what=True)
             # print('len(tmp)', len(tmp))
             self._correlations = oicorr.corrSpectra(_tmp)
 
@@ -1589,7 +1910,7 @@ class OI:
 
         self.grid = oimodels.gridFitOI(
             self._merged,
-            model,
+            firstGuess,
             expl,
             Nfits,
             fitOnly=fitOnly,
@@ -1624,9 +1945,9 @@ class OI:
         logV=False,
         cmap="gist_stern",
         fig=None,
-        interpolate=False,
+        interpolate=True,
         legend=True,
-        tight=False,
+        tight=True,
         significance=False,
     ):
         """
@@ -1875,7 +2196,7 @@ class OI:
         if not showAny:
             print("nothing to show!")
             return
-        plt.close(self.fig)
+        oimodels.closefig(self.fig)
         plt.figure(self.fig)
         p = 1
         for d in self.data:
@@ -1916,6 +2237,7 @@ class OI:
         cColors={},
         cMarkers={},
         showSED=None,
+        showNegSED=True,
         errSED=False,
         showPhotCent=False,
         imLegend=True,
@@ -1925,6 +2247,7 @@ class OI:
         t3B="max",
         modelNames=None,
         modelColors=None,
+        unwrap180=False,
         avgData=False,
     ):
         """
@@ -1948,6 +2271,7 @@ class OI:
             computed for the averaged (u,v) instead!!!
         - barycentric: use barycentric velocities, if possible
         - autoLimV: automatic limits for visibility (|V|, V2) plots (default=False).
+        - unwrap180: unwrap phases with 180 (useful if phases flip abruptly)
 
         show image(s) and spectrum of model: set imFov to a value to show image
         - imFov: field of view in mas
@@ -1966,6 +2290,7 @@ class OI:
         - cColors: an optional dictionary to set the color of each components in
             the SED plot
         - showSED: show SED of components (default=True)
+        - showNegSED: show negative SED (default=True)
         - errSED: show uncertainties in SED, only works for bestfit model.
             default: False. (boolean or can be a number of sigma)
         - t3B: baseline for displaying T3 'min', 'max' or 'avg'
@@ -2037,7 +2362,9 @@ class OI:
             errSED = False
 
         if avgData:
-            print('\033[36maveraging data: beware that model is averaged differently (average u,v)!\033[0m')
+            print(
+                "\033[36maveraging data: beware that model is averaged differently (average u,v)!\033[0m"
+            )
             data = oifits.mergeOI(self.data, collapse=False, dMJD=self.dMJD)
             data = oifits.averageOI(data)
         else:
@@ -2045,6 +2372,9 @@ class OI:
 
         if allInOne or perSetup:
             data = oifits.mergeOI(data, collapse=False, verbose=False, dMJD=self.dMJD)
+
+        if self._inject != {}:
+            data = oimodels._injectFeatures(data, self._basemodel, self._inject)
 
         if not model is None and not imFov is None and checkImVis:
             # -- only works with single model!
@@ -2098,11 +2428,7 @@ class OI:
                 for s in perSetup:
                     _data.append(
                         oifits.mergeOI(
-                            [
-                                data[i]
-                                for i in range(len(data))
-                                if s in insnames[i]
-                            ],
+                            [data[i] for i in range(len(data)) if s in insnames[i]],
                             collapse=False,
                             verbose=False,
                             dMJD=self.dMJD,
@@ -2181,6 +2507,7 @@ class OI:
                     t3B=t3B,
                     modelNames=modelNames,
                     modelColors=modelColors,
+                    unwrap180=unwrap180,
                 )
                 self._dataAxes[perSetup[j]] = oimodels.ai1ax
                 self._dataFig = oimodels.ai1fig
@@ -2224,6 +2551,7 @@ class OI:
                         cmap=cmap,
                         logS=logS,
                         showSED=showSED,
+                        showNegSED=showNegSED,
                         errSED=errSED,
                         showIM=showIM,
                         imPhotCent=showPhotCent,
@@ -2293,6 +2621,7 @@ class OI:
                 t3B=t3B,
                 modelNames=modelNames,
                 modelColors=modelColors,
+                unwrap180=unwrap180,
             )
 
             self._dataAxes["ALL"] = oimodels.ai1ax
@@ -2338,6 +2667,7 @@ class OI:
                         cmap=cmap,
                         logS=logS,
                         showSED=showSED,
+                        showNegSED=showNegSED,
                         errSED=errSED,
                         showIM=showIM,
                         imPhotCent=showPhotCent,
@@ -2386,6 +2716,8 @@ class OI:
                         t3B=t3B,
                         modelNames=modelNames,
                         modelColors=modelColors,
+                        unwrap180=unwrap180,
+
                     )
                 )
                 self.fig += 1
@@ -2421,6 +2753,7 @@ class OI:
                         cmap=cmap,
                         logS=logS,
                         showSED=showSED,
+                        showNegSED=showNegSED,
                         errSED=errSED,
                         showIM=showIM,
                         imPhotCent=showPhotCent,
@@ -2447,6 +2780,7 @@ class OI:
         cColors={},
         cMarkers={},
         showSED=True,
+        showNegSED=True,
         errSED=False,
         showIM=True,
         fig=None,
@@ -2479,7 +2813,6 @@ class OI:
 
         errSED: show uncertainties in SED (should only be used for best fit model!)
         """
-
         # -- just if the function is used to show models
         if len(self.data) == 0 or (len(self.data) == 1 and not WL is None):
             # assert not WL is None, 'specify wavelength vector "WL="'
@@ -2497,6 +2830,8 @@ class OI:
         if model == "best" and type(self.bestfit) is dict and "best" in self.bestfit:
             # model = self.bestfit['best']
             model = oimodels.computeLambdaParams(self.bestfit["best"])
+        if type(model) == dict:
+            model = oimodels.computeLambdaParams(model)
 
         # -- this is actually not needed
         # model = oimodels.computeLambdaParams(model,)
@@ -2585,13 +2920,14 @@ class OI:
             figWidth = min(figHeight * nplot, FIG_MAX_WIDTH)
         if not figWidth is None and figHeight is None:
             figHeight = max(figWidth / nplot, FIG_MAX_HEIGHT)
-        plt.close(fig)
+        oimodels.closefig(fig)
+
         self._modelFig = plt.figure(fig, figsize=(figWidth, figHeight))
         if not title is None:
             plt.suptitle(title, color=titleColor)
         i = -1  # default, in case only SED
         self._modelAxes = {}
-        for i, wl0 in enumerate(imWl0): # for each wavelength
+        for i, wl0 in enumerate(imWl0):  # for each wavelength
             ax = plt.subplot(1, nplot, i + 1, aspect="equal")
             if not "images" in self._modelAxes:
                 self._modelAxes["images"] = [ax]
@@ -2620,7 +2956,7 @@ class OI:
                         fontsize=5,
                     )
             # -- index of image in cube, closest wavelength
-            #i0 = np.argmin(np.abs(self.images["WL"] * bcorr - wl0))
+            # i0 = np.argmin(np.abs(self.images["WL"] * bcorr - wl0))
             i0 = np.argmin(np.abs(self.images["WL"] - wl0))
 
             # -- normalised image
@@ -2635,7 +2971,9 @@ class OI:
                     #     print('image is all negative (?!)',np.min(im), np.max(im))
                     #     _imMax = 0
                     # else:
-                    _imMax = np.nanpercentile((im**imPow)[(im**imPow) >= 0], float(imMax))
+                    _imMax = np.nanpercentile(
+                        (im**imPow)[(im**imPow) >= 0], float(imMax)
+                    )
 
                     # _imMax = np.percentile(im**imPow, float(imMax))
                 else:
@@ -2647,7 +2985,7 @@ class OI:
                 self.images["X"],
                 self.images["Y"],
                 im**imPow,
-                cmap=cmap[i] if type(cmap)==list else cmap,
+                cmap=cmap[i] if type(cmap) == list else cmap,
                 vmax=_imMax,
                 vmin=0,
                 shading="auto",
@@ -2668,6 +3006,7 @@ class OI:
                 )
                 plt.legend(fontsize=6)
             if "spatial kernel" in model:
+                #print(f"DBG> {model['spatial kernel']=}")
                 xk = np.max(self.images["X"]) - model["spatial kernel"]
                 yk = np.min(self.images["Y"]) + model["spatial kernel"]
                 c = plt.Circle(
@@ -2716,7 +3055,7 @@ class OI:
                     cb.set_label(r"$\sqrt[%d]{Flux}$" % int(1 / imPow))
                 else:
                     # title = '$\mathrm{I}^{%.2f}$ at '%imPow
-                    cb.set_label("$Flux^{%.2f}$" % imPow)
+                    cb.set_label(r"$Flux^{%.2f}$" % imPow)
             else:
                 cb.set_label("linear scale")
                 title = ""
@@ -2733,8 +3072,10 @@ class OI:
                     / self.images["WL"][i0]
                     * 299792
                 )
-            plt.title(title, fontsize=9, y=1.05 if imPlx else None)
-
+            try:
+                plt.title(r''+title, fontsize=9, y=1.05 if imPlx else None)
+            except:
+                print('ERROR!', title)
             cmodel = oimodels.computeLambdaParams(model)
             if imLegend:
                 # -- show position of each components
@@ -2830,33 +3171,58 @@ class OI:
 
             for c in sorted(self.spectra[key + "COMP"]):
                 col = symbols[c]["c"]
-                w = self.spectra[key + "COMP"][c] > 0
-                if errSED and 'err '+key+'COMP' in self.spectra and \
-                        c in self.spectra['err '+key+'COMP']:
-                    if type(errSED)==bool:
-                        label = c + r' ($\pm1\sigma$)'
+                if showNegSED:
+                    w = np.isfinite(self.spectra[key + "COMP"][c])
+                else:
+                    w = self.spectra[key + "COMP"][c] > 0
+
+                if (
+                    errSED
+                    and "err " + key + "COMP" in self.spectra
+                    and c in self.spectra["err " + key + "COMP"]
+                ):
+                    if type(errSED) == bool:
+                        label = c + r" ($\pm1\sigma$)"
                     else:
-                        label = c + r' ($\pm%.1f\sigma$)'%float(errSED)
-                    plt.fill_between(self.spectra[key + "WL"][w] * bcorr,
-                        self.spectra[key + "COMP"][c][w]+float(errSED)*self.spectra['err '+key+'COMP'][c][w],
-                        self.spectra[key + "COMP"][c][w]-float(errSED)*self.spectra['err '+key+'COMP'][c][w],
-                        color=col, alpha=0.5, label=label,)
+                        label = c + r" ($\pm%.1f\sigma$)" % float(errSED)
+                    plt.fill_between(
+                        self.spectra[key + "WL"][w] * bcorr,
+                        self.spectra[key + "COMP"][c][w]
+                        + float(errSED) * self.spectra["err " + key + "COMP"][c][w],
+                        self.spectra[key + "COMP"][c][w]
+                        - float(errSED) * self.spectra["err " + key + "COMP"][c][w],
+                        color=col,
+                        alpha=0.5,
+                        label=label,
+                    )
                 else:
                     plt.plot(
                         self.spectra[key + "WL"][w] * bcorr,
                         self.spectra[key + "COMP"][c][w],
-                        "-", label=c, color=col, linewidth=1.5,
+                        ".",
+                        label=c,
+                        color=col,
+                        linewidth=1.5,
                     )
-            if errSED and 'err '+key+'TOTAL' in self.spectra:
-                plt.fill_between(self.spectra[key + "WL"][w] * bcorr,
-                    self.spectra[key + "TOTAL"][w]+float(errSED)*self.spectra['err '+key+'TOTAL'][w],
-                    self.spectra[key + 'TOTAL'][w]-float(errSED)*self.spectra['err '+key+'TOTAL'][w],
-                    color='0.4', alpha=0.5, label='TOTAL',)
+            if errSED and "err " + key + "TOTAL" in self.spectra:
+                plt.fill_between(
+                    self.spectra[key + "WL"][w] * bcorr,
+                    self.spectra[key + "TOTAL"][w]
+                    + float(errSED) * self.spectra["err " + key + "TOTAL"][w],
+                    self.spectra[key + "TOTAL"][w]
+                    - float(errSED) * self.spectra["err " + key + "TOTAL"][w],
+                    color="0.4",
+                    alpha=0.5,
+                    label="TOTAL",
+                )
             else:
                 plt.plot(
                     self.spectra[key + "WL"] * bcorr,
                     self.spectra[key + "TOTAL"],
-                    "-", label="TOTAL", linewidth=2, color="0.4",
+                    ".",
+                    label="TOTAL",
+                    linewidth=2,
+                    color="0.4",
                 )
             # -- show imWl0
             # plt.scatter(imWl0, np.interp(imWl0, self.spectra[key+'WL'], self.spectra[key+'TOTAL']),
@@ -2943,7 +3309,8 @@ class OI:
         other parameters: see 'doFit'
         """
         self._merged = oifits.mergeOI(
-            self.data, collapse=True, verbose=False, dMJD=self.dMJD)
+            self.data, collapse=True, verbose=False, dMJD=self.dMJD
+        )
         self.bestfit = oimodels.sparseFitFluxes(
             self._merged,
             firstGuess,
@@ -2956,7 +3323,8 @@ class OI:
             maxfev=maxfev,
             ftol=ftol,
             epsfcn=epsfcn,
-            prior=prior)
+            prior=prior,
+        )
         self._model = oimodels.VmodelOI(self._merged, self.bestfit["best"])
         self.computeModelSpectra(uncer=False)
         self.bestfit["prior"] = prior
@@ -3077,7 +3445,7 @@ class OI:
 
         result is stored in the dictionnary self.images:
         'WL': wavelength (in um), sorted
-        'cube': image cube, cube[i] is the i-th wavelength
+        'image': image cube, cube[i] is the i-th wavelength
         'X', 'Y': 2D arrays of coordinates of pixels
         'scale': actual pixel scale (in mas)
 
@@ -3204,14 +3572,21 @@ class OI:
             for k in d[key]:
                 # -- dims are uv, wl, x, y
                 phi = (
-                    -2j*_c*(
+                    -2j
+                    * _c
+                    * (
                         res["X"][None, None, :, :] * d[key][k]["u/wl"][:, :, None, None]
                         + res["Y"][None, None, :, :]
-                        * d[key][k]["v/wl"][:, :, None, None]))
+                        * d[key][k]["v/wl"][:, :, None, None]
+                    )
+                )
                 # -- complex visibility
-                vis = (np.sum(
+                vis = (
+                    np.sum(
                         res["cube"][wl, :, :][None, :, :, :] * np.exp(phi), axis=(2, 3)
-                    )/ norm)
+                    )
+                    / norm
+                )
                 tmp["OI_VIS"][k] = {
                     "|V|": np.abs(vis),
                     "PHI": np.angle(vis) * 180 / np.pi,
@@ -3304,11 +3679,17 @@ class OI:
             model = self.bestfit["best"]
             if not uncer is False:
                 # -- randomise parameters, using covariance
-                models = oimodels.dpfit.randomParam(self.bestfit, N=Niter, x=None)["r_param"]
+                models = oimodels.dpfit.randomParam(self.bestfit, N=Niter, x=None)[
+                    "r_param"
+                ]
                 uncer = False
 
         if not uncer is False:
-            if type(uncer)==list and len(set([type(u) for u in uncer]))==1 and type(uncer[0])==dict:
+            if (
+                type(uncer) == list
+                and len(set([type(u) for u in uncer])) == 1
+                and type(uncer[0]) == dict
+            ):
                 models = uncer
 
         # assert type(model) is dict, "model must be a dictionnary"
@@ -3320,115 +3701,195 @@ class OI:
         else:
             self.spectra = _computeSpectra(model, self.data, models=models)
 
+    def wideBinary(
+        self,
+        minSep=1,
+        maxSep=200,
+        model=None,
+        wide="2",
+        plot=False,
+        obs=None,
+        wlMin=None,
+        wlMax=None,
+    ):
 
-    def wideBinary(self, minSep=1, maxSep=200, model=None, wide='2',
-                plot=False, obs=None, wlMin=None, wlMax=None):
-
-        O = {'|V|':'OI_VIS', 'PHI':'OI_VIS', 'V2':'OI_VIS2'}
+        O = {"|V|": "OI_VIS", "PHI": "OI_VIS", "V2": "OI_VIS2"}
 
         if obs is None:
             obs = []
             for d in self.data:
-                if 'fit' in d and 'obs' in d['fit']:
-                    obs.extend(filter(lambda x: x in O, d['fit']['obs']))
+                if "fit" in d and "obs" in d["fit"]:
+                    obs.extend(filter(lambda x: x in O, d["fit"]["obs"]))
             obs = list(set(obs))
-            if obs==[]:
+            if obs == []:
                 print("please provide obseravbles in ['|V|', 'PHI', 'V2']")
             return
-        if model is None and 'best' in self.bestfit['best']:
-            model = self.bestfit['best'].copy
+        if model is None and "best" in self.bestfit["best"]:
+            model = self.bestfit["best"].copy
 
         sep = np.logspace(np.log10(minSep), np.log10(maxSep), 500)
         res = []
-        self.fig+=1
+        self.fig += 1
         if plot:
-            plt.close(self.fig); plt.figure(self.fig, figsize=(9,4))
+            oimodels.closefig(self.fig)
+            plt.figure(self.fig, figsize=(9, 4))
         F = []
         for d in self.data:
-            #print(d['filename'])
+            # print(d['filename'])
             if not model is None:
                 Vtrend = oimodels.VmodelOI(d, model)
             else:
                 Vtrend = None
             for o in obs:
-                for i,k in enumerate(d[O[o]].keys()):
+                for i, k in enumerate(d[O[o]].keys()):
                     if plot:
-                        ax = plt.subplot(len(d[O[o]]), len(obs), len(obs)*i+1)
+                        ax = plt.subplot(len(d[O[o]]), len(obs), len(obs) * i + 1)
                         plt.ylabel(k)
-                        if i==0:
-                            plt.title(', '.join(obs))
-                    for j,y in enumerate(d[obs[o]][k][o]):
-                        w = ~d[O[o]][k]['FLAG'][j]
-                        if 'fit' in d and 'wl ranges' in d['fit']:
-                            wwl = ~d['WL']>0
-                            for WLR in d['fit']['wl ranges']:
-                                wwl = np.logical_or(wwl, (d['WL']>=WLR[0])*(d['WL']<=WLR[1]))
+                        if i == 0:
+                            plt.title(", ".join(obs))
+                    for j, y in enumerate(d[obs[o]][k][o]):
+                        w = ~d[O[o]][k]["FLAG"][j]
+                        if "fit" in d and "wl ranges" in d["fit"]:
+                            wwl = ~d["WL"] > 0
+                            for WLR in d["fit"]["wl ranges"]:
+                                wwl = np.logical_or(
+                                    wwl, (d["WL"] >= WLR[0]) * (d["WL"] <= WLR[1])
+                                )
                             w = np.logical_and(w, wwl)
 
-                        B = np.sqrt(d[O[o]][k]['u'][j]**2+d[O[o]][k]['v'][j]**2)
-                        PA = np.arctan2(d[O[o]][k]['u'][j], d[O[o]][k]['v'][j])
-                        csep = np.cos(2*np.pi*sep[None,:]*B[None,None]/d['WL'][w][:,None]*np.pi/180/3600/1000/1e-6)
-                        ssep = np.sin(2*np.pi*sep[None,:]*B[None,None]/d['WL'][w][:,None]*np.pi/180/3600/1000/1e-6)
+                        B = np.sqrt(d[O[o]][k]["u"][j] ** 2 + d[O[o]][k]["v"][j] ** 2)
+                        PA = np.arctan2(d[O[o]][k]["u"][j], d[O[o]][k]["v"][j])
+                        csep = np.cos(
+                            2
+                            * np.pi
+                            * sep[None, :]
+                            * B[None, None]
+                            / d["WL"][w][:, None]
+                            * np.pi
+                            / 180
+                            / 3600
+                            / 1000
+                            / 1e-6
+                        )
+                        ssep = np.sin(
+                            2
+                            * np.pi
+                            * sep[None, :]
+                            * B[None, None]
+                            / d["WL"][w][:, None]
+                            * np.pi
+                            / 180
+                            / 3600
+                            / 1000
+                            / 1e-6
+                        )
 
                         # -- detrend
-                        if 'fit' in d and o+' order' in d['fit']:
-                            order = d['fit'][o+' order']
+                        if "fit" in d and o + " order" in d["fit"]:
+                            order = d["fit"][o + " order"]
                         else:
                             order = 1
-                        c = np.polyfit(d['WL'][w], y[w], order)
-                        C = np.sum((y[w]-np.polyval(c, d['WL'][w]))[:,None]*csep, axis=0)
-                        S = np.sum((y[w]-np.polyval(c, d['WL'][w]))[:,None]*ssep, axis=0)
-                        p = C**2+S**2
+                        c = np.polyfit(d["WL"][w], y[w], order)
+                        C = np.sum(
+                            (y[w] - np.polyval(c, d["WL"][w]))[:, None] * csep, axis=0
+                        )
+                        S = np.sum(
+                            (y[w] - np.polyval(c, d["WL"][w]))[:, None] * ssep, axis=0
+                        )
+                        p = C**2 + S**2
                         _c, _s = C[p.argmax()], S[p.argmax()]
-                        _c, _s = _c/np.sqrt(_c**2+_s**2), _s/np.sqrt(_c**2+_s**2)
+                        _c, _s = (
+                            _c / np.sqrt(_c**2 + _s**2),
+                            _s / np.sqrt(_c**2 + _s**2),
+                        )
                         res.append((PA, sep[p.argmax()], k, _c, _s))
-                        if o=='|V|':
-                            F.append(np.nanstd(y[w])/np.nanmean(y[w]))
-                        elif o=='PHI':
-                            F.append(np.nanstd(y[w])/180)
-                        elif o=='V2':
-                            F.append(np.nanstd(y[w])/np.nanmean(y[w])/2)
+                        if o == "|V|":
+                            F.append(np.nanstd(y[w]) / np.nanmean(y[w]))
+                        elif o == "PHI":
+                            F.append(np.nanstd(y[w]) / 180)
+                        elif o == "V2":
+                            F.append(np.nanstd(y[w]) / np.nanmean(y[w]) / 2)
 
                         if plot:
-                            plt.plot(d['WL'][w], y[w], '.k', alpha=0.1)
-                            plt.plot(d['WL'][w], (_c*csep[:,p.argmax()] + _s*ssep[:,p.argmax()])*np.ptp(y[w])/2 +
-                                    np.polyval(c, d['WL'][w]), ':g', alpha=0.8, linewidth=3)
+                            plt.plot(d["WL"][w], y[w], ".k", alpha=0.1)
+                            plt.plot(
+                                d["WL"][w],
+                                (_c * csep[:, p.argmax()] + _s * ssep[:, p.argmax()])
+                                * np.ptp(y[w])
+                                / 2
+                                + np.polyval(c, d["WL"][w]),
+                                ":g",
+                                alpha=0.8,
+                                linewidth=3,
+                            )
         if plot:
-            plt.xlabel(r'wavelength ($\mu$m)')
+            plt.xlabel(r"wavelength ($\mu$m)")
         res = sorted(res, key=lambda x: x[2])
 
         # -- list os apparent separations
-        PA = np.array([r[0]*180/np.pi for r in res if r[1]>sep.min() and r[1]<sep.max()])
-        SEP = np.array([r[1] for r in res if r[1]>sep.min() and r[1]<sep.max()])
+        PA = np.array(
+            [r[0] * 180 / np.pi for r in res if r[1] > sep.min() and r[1] < sep.max()]
+        )
+        SEP = np.array([r[1] for r in res if r[1] > sep.min() and r[1] < sep.max()])
 
         # -- fit projected separation
-        abscos = lambda x, p: np.abs(np.cos((x-p['PA'])*np.pi/180))*p['SEP']
-        fit = pmoired.oimodels.dpfit.leastsqFit(abscos, PA,
-                                                {'SEP':max(SEP), 'PA':PA[np.argmax(SEP)]+180},
-                                                SEP, verbose=0)
+        abscos = lambda x, p: np.abs(np.cos((x - p["PA"]) * np.pi / 180)) * p["SEP"]
+        fit = pmoired.oimodels.dpfit.leastsqFit(
+            abscos,
+            PA,
+            {"SEP": max(SEP), "PA": PA[np.argmax(SEP)] + 180},
+            SEP,
+            verbose=0,
+        )
 
         if plot:
-            ax = plt.subplot(1,2,2,projection='polar')
+            ax = plt.subplot(1, 2, 2, projection="polar")
 
-            ax.plot((90+PA)*np.pi/180, SEP, 'ob', alpha=0.5)
-            ax.plot((90+(PA+360)%(360)-180)*np.pi/180, SEP, 'ob', alpha=0.5)
-            k = ''
+            ax.plot((90 + PA) * np.pi / 180, SEP, "ob", alpha=0.5)
+            ax.plot((90 + (PA + 360) % (360) - 180) * np.pi / 180, SEP, "ob", alpha=0.5)
+            k = ""
             for r in res:
-                if r[2]!=k and r[1]>sep.min():
-                    plt.text(r[0]+np.pi/2, r[1]+10, r[2], fontsize=6, alpha=0.5, ha='center', va='center')
-                    plt.text(r[0]-np.pi/2, r[1]+10, r[2], fontsize=6, alpha=0.5, ha='center', va='center')
+                if r[2] != k and r[1] > sep.min():
+                    plt.text(
+                        r[0] + np.pi / 2,
+                        r[1] + 10,
+                        r[2],
+                        fontsize=6,
+                        alpha=0.5,
+                        ha="center",
+                        va="center",
+                    )
+                    plt.text(
+                        r[0] - np.pi / 2,
+                        r[1] + 10,
+                        r[2],
+                        fontsize=6,
+                        alpha=0.5,
+                        ha="center",
+                        va="center",
+                    )
                     k = r[2]
             # -- model of projected separation
             t = np.linspace(-np.pi, np.pi, 360)
-            bsep, bpa = fit['best']['SEP'], fit['best']['PA'] # could be wrong by 180º!
-            plt.plot(t+np.pi/2, bsep*np.abs(np.cos(t-bpa*np.pi/180)), ':', color='orange')
+            bsep, bpa = fit["best"]["SEP"], fit["best"]["PA"]  # could be wrong by 180º!
+            plt.plot(
+                t + np.pi / 2,
+                bsep * np.abs(np.cos(t - bpa * np.pi / 180)),
+                ":",
+                color="orange",
+            )
             # -- binary separation
-            plt.plot([bpa*np.pi/180+np.pi/2, bpa*np.pi/180-np.pi/2], [bsep, bsep], '*', color='orange')
-            #plt.xlabel('PA$_\mathrm{baseline}$ - PA$_\mathrm{binary}$ (deg)')
-            #plt.title('apparent separation (mas)')
-            #D = [-180, -135, -90, -45, 0, 45, 90, 135]
-            #ax.xaxis.set_ticks(D)
-            #ax.xaxis.set_ticklabels(['-90\n(W)', '-45', 'PA=0 (N)', '45', '90\n(E)', '135', '180 (S)', '-135'])
+            plt.plot(
+                [bpa * np.pi / 180 + np.pi / 2, bpa * np.pi / 180 - np.pi / 2],
+                [bsep, bsep],
+                "*",
+                color="orange",
+            )
+            # plt.xlabel('PA$_\mathrm{baseline}$ - PA$_\mathrm{binary}$ (deg)')
+            # plt.title('apparent separation (mas)')
+            # D = [-180, -135, -90, -45, 0, 45, 90, 135]
+            # ax.xaxis.set_ticks(D)
+            # ax.xaxis.set_ticklabels(['-90\n(W)', '-45', 'PA=0 (N)', '45', '90\n(E)', '135', '180 (S)', '-135'])
             ax.set_ylim(0, sep.max())
             ax.xaxis.set_visible(False)
             ax.yaxis.set_visible(False)
@@ -3436,35 +3897,85 @@ class OI:
             plt.tight_layout()
             plt.subplots_adjust(hspace=0)
 
-        m = {'1,ud':0.1, '2,ud':0.,
-            '2,x':float(fit['best']['SEP']*np.sin(fit['best']['PA']*np.pi/180)),
-            '2,y':float(fit['best']['SEP']*np.cos(fit['best']['PA']*np.pi/180)),
-            '2,f':np.nanmean(F),
-            }
+        m = {
+            "1,ud": 0.1,
+            "2,ud": 0.0,
+            "2,x": float(fit["best"]["SEP"] * np.sin(fit["best"]["PA"] * np.pi / 180)),
+            "2,y": float(fit["best"]["SEP"] * np.cos(fit["best"]["PA"] * np.pi / 180)),
+            "2,f": np.nanmean(F),
+        }
 
         # -- check orientation
         mp = m.copy()
         for d in self.data:
             mem = []
             test = False
-            if 'fit' in d and 'obs' in d['fit']['obs']:
-                mem.append(d['fit']['obs'])
-            if 'OI_T3' in d:
+            if "fit" in d and "obs" in d["fit"]["obs"]:
+                mem.append(d["fit"]["obs"])
+            if "OI_T3" in d:
                 test = True
         if test:
             mp = m.copy()
 
-            self.setupFit({'obs':['T3PHI']})
+            self.setupFit({"obs": ["T3PHI"]})
             chi2 = oi._chi2FromModel(m)
-            mp['2,x']*=-1
-            mp['2,y']*=-1
+            mp["2,x"] *= -1
+            mp["2,y"] *= -1
             chi2p = oi._chi2FromModel(mp)
-            if mem!=[]:
-                for i,d in enumerate(self.data):
-                    d['fit']['obs'] = mem[i]
-            if chi2>chi2p:
+            if mem != []:
+                for i, d in enumerate(self.data):
+                    d["fit"]["obs"] = mem[i]
+            if chi2 > chi2p:
                 return mp
         return m
+    def getJSDCdiameter(self, altName=None):
+        """
+        returns a multi band model of the calibrator using uniform disk diameters tabulated from JSDC.
+
+        altName: alternate Name for Simbad, in case the name is not resolved
+        
+        please aknowledge the use of JSDC:
+
+            This research has made use of the Jean-Marie Mariotti Center JSDC catalogue, which involves 
+            the JMDC catalogue. \footnote{JSDC available at http://www.jmmc.fr/jsdc}
+        
+        """
+        global _aknowledge
+
+        bands = {'B':.445, 'V':.551, 'R':.658, 'I':0.806, 'J':1.22, 
+                 'H':1.63, 'K':2.19, 'L':3.45, 'M':4.75, 'N':10.5}
+        res = {}
+        for d in self.data:
+            dist = np.array([np.abs(bands[k]-np.mean(d['WL'])) for k in bands])
+            band = np.array(list(bands.keys()))[np.argmin(dist)]
+            name = d['targname'].replace('_', ' ')
+            if not altName is None:
+                name = altName
+            try:
+                V = Vizier.query_object(name, catalog="II/346")
+                res[band+',ud'] = V[0]['UDD'+band][0]
+                if _aknowledge['JSDC']:
+                    print('\033[97m-- Please aknowledge the use of the JSDC to estimate the diameter! ', '-'*44)
+                    print("This research has made use of the Jean-Marie Mariotti Center JSDC catalogue, "+
+                          "which involves the JMDC catalogue. ")
+                    print(r"\footnote{JSDC available at http://www.jmmc.fr/jsdc}")
+                    print('-'*112, '\033[0m')
+                    _aknowledge['JSDC'] = False
+
+            except:
+                print('\033[91mwarning: could not find diameter in JSDC!\033[0m')
+                res[band+',ud'] = 0.
+                
+            if not band+',range' in res:        
+                res[band+',range'] = (np.min(d['WL']), np.max(d['WL']))
+            else:
+                res[band+',range'] = (min(np.min(d['WL']), res[band+',range'][0]), 
+                                      max(np.max(d['WL']), res[band+',range'][1]))
+        K = list(filter(lambda x: x.endswith(',range'), res.keys()))
+        for k in K:
+            res[k.replace('range', 'spectrum')] = f'($WL>={res[k][0]})*($WL<={res[k][1]})'
+            res.pop(k)
+        return res
 
 
 def _computeSpectra(model, data, models):
@@ -3493,7 +4004,7 @@ def _computeSpectra(model, data, models):
                 if not c in allCont:
                     allCont.append(c)
         if "fit" in o and "wl kernel" in o["fit"]:
-            fit['wl kernel'] = o['fit']['wl kernel']
+            fit["wl kernel"] = o["fit"]["wl kernel"]
 
         if not "fit" in o:
             o["fit"] = fit.copy()
@@ -3535,13 +4046,13 @@ def _computeSpectra(model, data, models):
         allWL = {"WL": allWLc, "fit": {"obs": []}, "MJD": allMJD}  # minimum required
         kernel = []
         for o in data:
-            if 'fit' in o and 'wl kernel' in o['fit']:
-                kernel.append(o['fit']['wl kernel'])
+            if "fit" in o and "wl kernel" in o["fit"]:
+                kernel.append(o["fit"]["wl kernel"])
         kernel = list(set(kernel))
-        if len(kernel)==1:
-            allWL['fit']['wl kernel'] = kernel[0]
-        elif  len(kernel)>1:
-            print('WARNING: ambitious wavelength kernel for global spectrum')
+        if len(kernel) == 1:
+            allWL["fit"]["wl kernel"] = kernel[0]
+        elif len(kernel) > 1:
+            print("WARNING: ambitious wavelength kernel for global spectrum")
 
         if not Nr is None:
             allWL["fit"]["Nr"] = Nr
@@ -3567,20 +4078,22 @@ def _computeSpectra(model, data, models):
                     for k in tmp["MODEL"].keys()
                     if k.endswith(",flux")
                 }
-                efluxes['total'] = np.std([t["MODEL"]["totalflux"] for t in tmps], axis=0)
+                efluxes["total"] = np.std(
+                    [t["MODEL"]["totalflux"] for t in tmps], axis=0
+                )
             except:
-               efluxes = {
-                   "total": np.std([t["MODEL"]["totalflux"] for t in tmps], axis=0)
-               }
+                efluxes = {
+                    "total": np.std([t["MODEL"]["totalflux"] for t in tmps], axis=0)
+                }
         else:
             efluxes = {}
 
         M["flux WL"] = allWLc
         M["flux COMP"] = fluxes
         M["flux TOTAL"] = tmp["MODEL"]["totalflux"]
-        if 'total' in efluxes:
-            M["err flux TOTAL"] = efluxes['total']
-            efluxes.pop('total')
+        if "total" in efluxes:
+            M["err flux TOTAL"] = efluxes["total"]
+            efluxes.pop("total")
         M["err flux COMP"] = efluxes
 
         if not models is None:
@@ -3602,13 +4115,13 @@ def _computeSpectra(model, data, models):
 
         kernel = []
         for o in data:
-            if 'fit' in o and 'wl kernel' in o['fit']:
-                kernel.append(o['fit']['wl kernel'])
+            if "fit" in o and "wl kernel" in o["fit"]:
+                kernel.append(o["fit"]["wl kernel"])
         kernel = list(set(kernel))
-        if len(kernel)==1:
-            allWL['fit']['wl kernel'] = kernel[0]
-        elif  len(kernel)>1:
-            print('WARNING: ambitious wavelength kernel for global spectrum')
+        if len(kernel) == 1:
+            allWL["fit"]["wl kernel"] = kernel[0]
+        elif len(kernel) > 1:
+            print("WARNING: ambitious wavelength kernel for global spectrum")
 
         if not Nr is None:
             allWL["fit"]["Nr"] = Nr
@@ -3632,10 +4145,13 @@ def _computeSpectra(model, data, models):
                     for k in tmp["MODEL"].keys()
                     if k.endswith(",nflux")
                 }
-                efluxes["total"] = np.std([t["MODEL"]["totalnflux"] for t in tmps], axis=0)
+                efluxes["total"] = np.std(
+                    [t["MODEL"]["totalnflux"] for t in tmps], axis=0
+                )
 
             except:
-                efluxes = {"total": np.std([t["MODEL"]["totalnflux"] for t in tmps], axis=0)
+                efluxes = {
+                    "total": np.std([t["MODEL"]["totalnflux"] for t in tmps], axis=0)
                 }
 
         else:
@@ -3649,14 +4165,15 @@ def _computeSpectra(model, data, models):
         M["normalised spectrum WL"] = allWLs
         M["normalised spectrum COMP"] = fluxes
         M["normalised spectrum TOTAL"] = tmp["MODEL"]["totalnflux"]
-        if 'total' in efluxes:
-            M["err normalised spectrum TOTAL"] = efluxes['total']
-            efluxes.pop('total')
+        if "total" in efluxes:
+            M["err normalised spectrum TOTAL"] = efluxes["total"]
+            efluxes.pop("total")
         M["err normalised spectrum COMP"] = efluxes
 
         if not models is None:
             M["err normalised spectrum TOTAL"] = np.std(
-                [t["MODEL"]["totalnflux"] for t in tmps], axis=0)
+                [t["MODEL"]["totalnflux"] for t in tmps], axis=0
+            )
     else:
         M["normalised spectrum WL"] = np.array([])
         M["normalised spectrum COMP"] = {}
@@ -3701,6 +4218,7 @@ def _checkSetupFit(fit):
         "obs": list,
         "wl ranges": list,
         "baseline ranges": list,
+        "spatial frequency ranges": list,
         "MJD ranges": list,
         "Nr": int,
         "continuum ranges": list,
@@ -3731,7 +4249,7 @@ def _checkSetupFit(fit):
         "FLUX",
         "NFLUX",
         "CF",
-        ]
+    ]
     for k in fit["obs"]:
         if k not in knownObs:
             raise Exception("Unknown observable '" + k + "', not in " + str(knownObs))
@@ -3790,31 +4308,60 @@ def _recsizeof(s):
     else:
         return sys.getsizeof(s)
 
-def _getTfParamsOI(oi, obs=None, withVSlope=False):
-    if type(oi)==list:
-            res = {}
-            for d in oi:
-                res.update(_getTfParamsOI(d, obs=obs, withVSlope=withVSlope))
-            return res
+def _getTfParamsOI(oi, obs=None, order=None):
+    if type(oi) == list:
+        res = {}
+        for d in oi:
+            res.update(_getTfParamsOI(d, obs=obs, order=order))
+        return res
+
+    if order is None:
+        order = {}
     # -- generate Transfer Function parameters depending on baselines
-    if obs is None and 'fit' in oi and 'obs' in oi['fit']:
-        obs = oi['fit']['obs']
-    #print('obs:', obs)
+    if obs is None and "fit" in oi and "obs" in oi["fit"]:
+        obs = oi["fit"]["obs"]
+    # print('obs:', obs)
     res = {}
-    ext = {'V2':'OI_VIS2', '|V|':'OI_VIS', 'T3PHI':'OI_T3'}
-    ext = {k:ext[k] for k in obs if k in ext}
+    ext = {"V2": "OI_VIS2", "|V|": "OI_VIS", "T3PHI": "OI_T3"}
+    ext = {k: ext[k] for k in obs if k in ext}
+
     for e in ext:
         for k in oi[ext[e]]:
-            if 'VIS' in ext[e]:
-                res['#TF_'+e+'_'+k+'_*'] = 1.0
-                if withVSlope:
-                    res['#TF_'+e+'_'+k+'_s'] = 0.01
+            if e=='T3PHI':
+                res["#TF_" + e + "_" + k + "_+0"] = 0.01
+                if e in order:
+                    for i in range(order[e]):
+                        res["#TF_" + e + "_" + k + "_+"+str(i+1)] = 0.01
             else:
-                res['#TF_'+e+'_'+k+'_+'] = 0.01
+                res["#TF_" + e + "_" + k + "_*0"] = 1.0
+                if e in order:
+                    for i in range(order[e]):
+                        res["#TF_" + e + "_" + k + "_*"+str(i+1)] = 0.01
     return res
 
-
-
+def GRAVITYfiberLoss(sep, D=8.2, wl=2.2e-6, verbose=False):
+    """
+    coupling efficiency in GRAVITY's single mode fibers
+    
+    sep: off-axis separation in mas
+    D : telescope diameter in m (default 8.2m)
+    wl: wavelength in m (default 2.2e-6m)
+    
+    see Wang+ 2021: https://iopscience.iop.org/article/10.3847/1538-3881/abdb2d/pdf 
+        annex A, equation A4
+    """
+    if type(sep)==list or type(sep)==np.ndarray:
+        return np.array([GRAVITYfiberLoss(s, D=D, wl=wl) for s in sep])
+        
+    N = 101
+    X, Y = np.meshgrid(np.linspace(-D/2, D/2, N), np.linspace(-D/2, D/2, N))
+    R2 = X**2+Y**2
+    P = 1.0*(np.sqrt(R2)<(D/2))
+    off = sep*np.pi/(180*3600*1000)
+    w0 = 0.32*D
+    res = np.trapezoid(np.trapezoid(P*np.exp(2j*np.pi*off*X/wl - R2/(2*w0**2))))
+    res /= np.trapezoid(np.trapezoid(P*np.exp(-R2/(2*w0**2))))
+    return np.abs(res)**2
 
 if __name__ == "__main__":
     pass

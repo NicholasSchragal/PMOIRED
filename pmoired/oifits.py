@@ -2,6 +2,8 @@ import copy
 import glob
 import os
 from collections import OrderedDict
+import itertools
+import pickle
 
 import numpy as np
 from astropy.io import fits
@@ -9,6 +11,12 @@ import scipy.signal
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation
 import astropy.units as aU
+
+try:
+    # Necessary while Python versions below 3.9 are supported.
+    import importlib_resources as resources
+except ImportError:
+    from importlib import resources
 
 def _isiterable(x):
     res = True
@@ -36,10 +44,16 @@ def _globlist(filenames, strict=False):
             assert len(g)>0, 'no file(s) found for '+str(filenames)
         return g
 
+p2vm_file = 'p2vm_flux.pckl'
+if os.path.exists(resources.files("pmoired").joinpath(p2vm_file)):
+    pfile = resources.files("pmoired").joinpath(p2vm_file)
+with open(pfile, 'rb') as f:
+    gravityP2vm = pickle.load(f)
+
 def loadOI(filename, insname=None, targname=None, verbose=True,
            withHeader=False, medFilt=None, tellurics=None, debug=False,
            binning=None, useTelluricsWl=True, barycentric=False, ignoreCF=False,
-           wlOffset=0.0, orderedWl=True):
+           wlOffset=0.0, orderedWl=True, autoFlat=True):
     """
     load OIFITS "filename" and return a dict:
 
@@ -69,7 +83,10 @@ def loadOI(filename, insname=None, targname=None, verbose=True,
     useTelluricsWL: use wavelength calibration provided by the tellurics (default==True)
     barycentric: compute barycentric velocities (default=False)
 
+    autoFlat: correct P2VM flat is not ran during reduction (GRAVITY only)
+
     """
+    global gravityP2vm
     if debug:
         print('DEBUG: loadOI', type(filename), type(filename)==np.str_)#filename)
     if tellurics is True:
@@ -171,10 +188,27 @@ def loadOI(filename, insname=None, targname=None, verbose=True,
     if withHeader:
         res['header'] = h[0].header
 
+    calibrated = 'unknown' 
+    if withHeader and 'VISCAL' in res['header']:
+        calibrated = res['header']['VISCAL']=='CALIBRATED'
+    if withHeader and 'PRODCATG' in res['header'] and 'UNCALIBRATED' in res['header']['PRODCATG']:
+        calibrated = False
+    if withHeader and 'ESO PRO CATG' in res['header'] and '_CALIBRATED' in res['header']['ESO PRO CATG']:
+        calibrated = True
+
     if verbose:
         print('loadOI: loading', res['filename'])
         print('  > insname:', '"'+insname+'"','targname:', '"'+targname+'"',
-                'pipeline:', '"'+res['pipeline']+'"')
+                'pipeline:', '"'+res['pipeline']+'"', end=' ')
+        if calibrated==True:
+            c = '\033[32m'
+        elif calibrated==False:
+            c = '\033[101m'
+        else:
+            c = '\033[35m'
+        print(f'calibrated: {c}{calibrated}\033[0m')
+
+    res['calibrated'] = calibrated
 
     # -- wavelength
     for hdu in h:
@@ -916,17 +950,22 @@ def loadOI(filename, insname=None, targname=None, verbose=True,
                 for k in res[e].keys():
                     mjd.extend(list(res[e][k]['MJD']))
         mjd = np.array(sorted(set(mjd)))
+
         #print('  > MJD:', sorted(set(mjd)))
         print('  > MJD:', mjd.shape, '[%.4f..%.4f]'%(min(mjd), max(mjd)), end=' ')
         print('~'+Time(np.mean(mjd), format='mjd').to_value('isot'))
         print('  >', '-'.join(res['telescopes']), end=' | ')
         _R = np.mean(res['WL']/res['dWL'])
-        _Rp = np.abs(np.mean(res['WL']/np.gradient(res['WL'])))
+        try:
+            _Rp = np.abs(np.mean(res['WL']/np.gradient(res['WL'])))
+        except:
+            _Rp = -1
         # -- resolution very different from spectral chanel pitch
-        if np.abs((_Rp-_R)/_R)>0.5:
+        if _Rp>0 and np.abs((_Rp-_R)/_R)>0.5:
             _cr = '\033[31m'
         else:
             _cr = '\033[0m'
+
 
         print('WL:', res['WL'].shape, '[', round(np.min(res['WL']), 3), '..',
               round(np.max(res['WL']), 3),
@@ -976,7 +1015,158 @@ def loadOI(filename, insname=None, targname=None, verbose=True,
                 for e in O[o]:
                     if e in res[o][k]:
                         res[o][k][e] = res[o][k][e][:,wls]
+
+    # -- correct for GRAVITY P2VM, is relevant
+    if 'OI_FLUX' in res and autoFlat:
+        P = [k for k in res['header'] if 'PRO REC' in k and 'PARAM' in k and 'NAME' in k
+                                        and 'flat-flux' in res['header'][k]]
+        if len(P) and res['header'][P[0].replace('NAME', 'VALUE')]=='false':
+            reso = res['header']['ESO INS SPEC RES']
+            for k in res['OI_FLUX']:
+                res['OI_FLUX'][k]['FLUX'] /= np.interp(res['WL'], gravityP2vm['WL'], gravityP2vm[reso])
+            res['header'][P[0].replace('NAME', 'VALUE')]='pmoired'
+
     return res
+
+def _applyTF(res, param=None):
+    """
+    res -> a OIFITS structured dict
+
+    param (or res['param'] if no para is given): TF parameters:
+
+    '#TF_|V|_U1U3_*n' : multiplicative factor of polynomial (Wl-mean(WL))**n for 
+        baseline U1U3 and visibility amplitude.
+
+    '#TF_T3PHI_U2U1U3_+n' : additive factor of polynomial (Wl-mean(WL))**n for 
+        triangle U2U1U3 and phase closure.
+    
+    can also provide per instrument [replace '_' with '' in the name of the instrument]
+    '#TFGRAVITYSC_T3PHI_U2U1U3_+n' : additive factor of polynomial (Wl-mean(WL))**n for 
+        triangle U2U1U3 and phase closure.
+
+    a TF for a given MJD can be given by adding "_xxx.xxx" at the end, for MJD=xxx.xxx
+
+    Observables: V2, |V|, T3PHI, PHI or CF
+
+    baselines / triangles: same as in the datastructure
+
+    type: *n or +n for multiplicative or additive TF
+    """
+    if param is None and 'param' in res:
+        param = res['param']
+
+    if 'insname' in res:
+        insname = res['insname'].replace('_', '')
+    else:
+        insname = ''
+
+    if any([k.startswith('#TF_') or k.startswith('#TF'+insname+'_') for k in param.keys()]):
+        _debug = False
+        if _debug:
+            print("computing TF")
+        # -- organise the TF coefficient
+        TF = {}
+        for k in param:
+            if k.startswith("#TF_") or k.startswith('#TF'+insname+'_'):
+                obs = k.split("_")[1]
+                if len(k.split("_"))>=5 :
+                    mjd = float(k.split("_")[4])
+                else:
+                    mjd = None
+                if not obs in TF:
+                    TF[obs] = {}
+                b = k.split("_")[2]
+                if not b in TF[obs]:
+                    TF[obs][b] = {}
+                if not mjd in TF[obs][b]:
+                    TF[obs][b][mjd] = {}
+                TF[obs][b][mjd][k.split("_")[3]] = param[k]
+
+        if _debug:
+            print(f"{TF=}")
+
+        O = {"V2": "OI_VIS2", 
+             "|V|": "OI_VIS", 
+             "T3PHI": "OI_T3", 
+             "PHI": "OI_VIS",
+             'CF': "OI_CF",
+             }
+
+        smooth = 0.5/24 # smoothing time for TF
+
+        for o in TF:
+            if _debug:
+                print(" -> applying TF to", o)
+            for b in TF[o]:  # for each baselines / triangles in the TF definition
+                if not O[o] in res: # nothing to calibrate
+                    continue
+
+                # -- calibrate with MJD interpolation
+                _tfmult = {}
+                _tfadd = {}
+                _weight = {}
+                for mjd in TF[o][b]:
+                    SN = list(filter(lambda x: x.startswith("*") and x[1:].isdigit(), TF[o][b][mjd]))
+                    if len(SN)>0:
+                        _tfmult[mjd] = np.zeros(res["WL"].shape)
+                        for sn in SN:
+                            _n = int(sn[1:])
+                            _tfmult[mjd] += TF[o][b][mjd][sn] * (res["WL"] - np.mean(res["WL"]))**_n  
+                    SN = list(filter(lambda x: x.startswith("+") and x[1:].isdigit(), TF[o][b][mjd]))
+                    if len(SN)>0:
+                        _tfadd[mjd] = np.zeros(res["WL"].shape)                            
+                        for sn in SN:
+                            _n = int(sn[1:])
+                            _tfadd[mjd] += TF[o][b][mjd][sn]*(res["WL"] - np.mean(res["WL"]))**_n
+                    
+                    if not mjd is None:
+                        # -- weight based on proximity in time HARD CODED!!!
+                        if 'all' in res[O[o]]:
+                            w = res[O[o]]["all"]["NAME"] == b
+                            _weight[mjd] = np.exp(-((res[O[o]]['all']['MJD2'][w,:]-mjd)/smooth)**2)
+                        else:
+                            _weight[mjd] = np.exp(-((res[O[o]][b]['MJD2']-mjd)/smooth)**2)
+                # -- merged data
+                if 'all' in res[O[o]]:
+                    #print('merged data', o)
+                    w = res[O[o]]["all"]["NAME"] == b
+                    _b = 'all'
+                else:
+                    #print('baselines', o, res[O[o]].keys())
+                    w = np.isfinite(res[O[o]][b]['MJD'])
+                    _b = b
+
+                # -- non MJD case:
+                if None in _tfadd:
+                    res[O[o]][_b][o][w,:] += _tfadd[None][None,:]
+                elif None in _tfmult:
+                    res[O[o]][_b][o][w,:] *= _tfmult[None][None,:] 
+
+                mjd = [x for x in _tfadd if not x is None]
+                if len(mjd)>0:
+                    _tf = 0
+                    _n = 0
+                    for x in mjd:
+                        _tf += _weight[x]*_tfadd[x][None,:]
+                        _n += _weight[x]
+                    res[O[o]][_b][o][w,:] += _tf/_n
+
+                mjd = [x for x in _tfmult if not x is None]
+                if len(mjd)>0:
+                    _tf = 0
+                    _n = 0
+                    for x in mjd:
+                        _tf += _weight[x]*_tfmult[x][None,:]
+                        _n += _weight[x]
+                    res[O[o]][_b][o][w,:] *= _tf/_n
+    return res
+
+def getTF(param, obs, b, wl):
+    addTF = 0
+    multTF = 1
+
+    return addTf, multTF
+
 
 def _binOI(res, binning=None, medFilt=None, noError=False):
     """
@@ -991,9 +1181,11 @@ def _binOI(res, binning=None, medFilt=None, noError=False):
         _dWL = res['dWL']*1.0
     else:
         _dWL = np.gradient(res['WL'])
+
     if 'binWL' in res:
         res['WL'] = res['binWL']*1.0
-        res['dWL'] = np.gradient(res['WL'])
+        #res['dWL'] = np.gradient(res['WL'])
+        #res['dWL'] = _dWL*(0+res['WL'])
     else:
         res['WL'] = np.linspace(res['WL'].min(),
                                 res['WL'].max(),
@@ -1005,7 +1197,7 @@ def _binOI(res, binning=None, medFilt=None, noError=False):
                              np.array([res['TELLURICS']]),
                              np.array([res['TELLURICS']<0]),
                              medFilt=medFilt,
-                             retFlag=False)[0]
+                             retFlag=False, d_wl=res['dWL'])[0]
     if 'OI_FLUX' in res:
         # -- Note the binning of flux is not weighted, because
         # -- it would make the tellurics correction incorrect
@@ -1015,11 +1207,11 @@ def _binOI(res, binning=None, medFilt=None, noError=False):
             res['OI_FLUX'][k]['FLUX'], flag =_binVec_flag(res['WL'], _WL,
                                             res['OI_FLUX'][k]['FLUX'],
                                             res['OI_FLUX'][k]['FLAG'],
-                                            medFilt=medFilt, retFlag=True)
+                                            medFilt=medFilt, retFlag=True, d_wl=res['dWL'])
             res['OI_FLUX'][k]['EFLUX'] = 1/_binVec_flag(res['WL'], _WL,
                                                 1/res['OI_FLUX'][k]['EFLUX'],
                                                 res['OI_FLUX'][k]['FLAG'],
-                                                medFilt=medFilt)
+                                                medFilt=medFilt, d_wl=res['dWL'])
             res['OI_FLUX'][k]['FLAG'] = flag
             res['OI_FLUX'][k]['MJD2'] = res['OI_FLUX'][k]['MJD'][:,None] + 0*res['WL'][None,:]
 
@@ -1033,13 +1225,13 @@ def _binOI(res, binning=None, medFilt=None, noError=False):
                                             res['OI_VIS2'][k]['FLAG'],
                                             None if noError else res['OI_VIS2'][k]['EV2'] ,
                                             medFilt=medFilt,
-                                            retFlag=True)
+                                            retFlag=True, d_wl=res['dWL'])
             if not noError:
                 res['OI_VIS2'][k]['EV2'] = 1/_binVec_flag(res['WL'], _WL,
                                                 1/res['OI_VIS2'][k]['EV2'],
                                                 res['OI_VIS2'][k]['FLAG'],
                                                 res['OI_VIS2'][k]['EV2'],
-                                                medFilt=medFilt)
+                                                medFilt=medFilt, d_wl=res['dWL'])
             res['OI_VIS2'][k]['FLAG'] = flag
             res['OI_VIS2'][k]['MJD2'] = res['OI_VIS2'][k]['MJD'][:,None] + 0*res['WL'][None,:]
             res['OI_VIS2'][k]['u/wl'] = res['OI_VIS2'][k]['u'][:,None]/res['WL'][None,:]
@@ -1054,23 +1246,23 @@ def _binOI(res, binning=None, medFilt=None, noError=False):
                                             res['OI_VIS'][k]['FLAG'],
                                             None if noError else res['OI_VIS'][k]['E|V|'],
                                             medFilt=medFilt,
-                                            retFlag=True)
+                                            retFlag=True, d_wl=res['dWL'])
             res['OI_VIS'][k]['PHI'] =_binVec_flag(res['WL'], _WL,
                                             res['OI_VIS'][k]['PHI'],
                                             res['OI_VIS'][k]['FLAG'],
                                             None if noError else res['OI_VIS'][k]['EPHI'],
-                                            medFilt=medFilt, phase=True)
+                                            medFilt=medFilt, phase=True, d_wl=res['dWL'])
             if not noError:
                 res['OI_VIS'][k]['E|V|'] = 1/_binVec_flag(res['WL'], _WL,
                                                 1/res['OI_VIS'][k]['E|V|'],
                                                 res['OI_VIS'][k]['FLAG'],
                                                 res['OI_VIS'][k]['E|V|'],
-                                                medFilt=medFilt)
+                                                medFilt=medFilt, d_wl=res['dWL'])
                 res['OI_VIS'][k]['EPHI'] = 1/_binVec_flag(res['WL'], _WL,
                                                 1/res['OI_VIS'][k]['EPHI'],
                                                 res['OI_VIS'][k]['FLAG'],
                                                 res['OI_VIS'][k]['EPHI'],
-                                                medFilt=medFilt)
+                                                medFilt=medFilt, d_wl=res['dWL'])
             res['OI_VIS'][k]['FLAG'] = flag
             res['OI_VIS'][k]['MJD2'] = res['OI_VIS'][k]['MJD'][:,None] + 0*res['WL'][None,:]
             res['OI_VIS'][k]['u/wl'] = res['OI_VIS'][k]['u'][:,None]/res['WL'][None,:]
@@ -1085,23 +1277,23 @@ def _binOI(res, binning=None, medFilt=None, noError=False):
                                             res['OI_CF'][k]['FLAG'],
                                             None if noError else res['OI_CF'][k]['ECF'],
                                             medFilt=medFilt,
-                                            retFlag=True)
+                                            retFlag=True, d_wl=res['dWL'])
             res['OI_CF'][k]['PHI'] =_binVec_flag(res['WL'], _WL,
                                             res['OI_CF'][k]['PHI'],
                                             res['OI_CF'][k]['FLAG'],
                                             None if noError else res['OI_CF'][k]['EPHI'],
-                                            medFilt=medFilt)
+                                            medFilt=medFilt, d_wl=res['dWL'])
             if not noError:
                 res['OI_CF'][k]['ECF'] = 1/_binVec_flag(res['WL'], _WL,
                                                 1/res['OI_CF'][k]['ECF'],
                                                 res['OI_CF'][k]['FLAG'],
                                                 res['OI_CF'][k]['ECF'],
-                                                medFilt=medFilt)
+                                                medFilt=medFilt, d_wl=res['dWL'])
                 res['OI_CF'][k]['EPHI'] = 1/_binVec_flag(res['WL'], _WL,
                                                 1/res['OI_CF'][k]['EPHI'],
                                                 res['OI_CF'][k]['FLAG'],
                                                 res['OI_CF'][k]['EPHI'],
-                                                medFilt=medFilt)
+                                                medFilt=medFilt, d_wl=res['dWL'])
             res['OI_CF'][k]['FLAG'] = flag
             res['OI_CF'][k]['MJD2'] = res['OI_CF'][k]['MJD'][:,None] + 0*res['WL'][None,:]
             res['OI_VIS'][k]['u/wl'] = res['OI_VIS'][k]['u'][:,None]/res['WL'][None,:]
@@ -1116,26 +1308,26 @@ def _binOI(res, binning=None, medFilt=None, noError=False):
                                                 res['OI_T3'][k]['T3AMP'],
                                                 res['OI_T3'][k]['FLAG'],
                                                 None if noError else res['OI_T3'][k]['ET3AMP'],
-                                                medFilt=medFilt)
+                                                medFilt=medFilt, d_wl=res['dWL'])
             if 'T3PHI' in res['OI_T3'][k]:
                 res['OI_T3'][k]['T3PHI'], flag =_binVec_flag(res['WL'], _WL,
                                                 res['OI_T3'][k]['T3PHI'],
                                                 res['OI_T3'][k]['FLAG'],
                                                 None if noError else res['OI_T3'][k]['ET3PHI'],
-                                                medFilt=medFilt, retFlag=True, phase=True)
+                                                medFilt=medFilt, retFlag=True, phase=True, d_wl=res['dWL'])
             if not noError:
                 if 'T3AMP' in res['OI_T3'][k]:
                     res['OI_T3'][k]['ET3AMP'] = 1/_binVec_flag(res['WL'], _WL,
                                                     1/res['OI_T3'][k]['ET3AMP'],
                                                     res['OI_T3'][k]['FLAG'],
                                                     res['OI_T3'][k]['ET3AMP'],
-                                                    medFilt=medFilt)
+                                                    medFilt=medFilt, d_wl=res['dWL'])
                 if 'T3PHI' in res['OI_T3'][k]:
                     res['OI_T3'][k]['ET3PHI'] = 1/_binVec_flag(res['WL'], _WL,
                                                     1/res['OI_T3'][k]['ET3PHI'],
                                                     res['OI_T3'][k]['FLAG'],
                                                     res['OI_T3'][k]['ET3PHI'],
-                                                    medFilt=medFilt)
+                                                    medFilt=medFilt, d_wl=res['dWL'])
             res['OI_T3'][k]['FLAG'] = flag
             res['OI_T3'][k]['MJD2'] = res['OI_T3'][k]['MJD'][:,None] + 0*res['WL'][None,:]
             res['OI_T3'][k]['u1/wl'] = res['OI_T3'][k]['u1'][:,None]/res['WL'][None,:]
@@ -1157,17 +1349,16 @@ def _binOI(res, binning=None, medFilt=None, noError=False):
                                             np.array([res['MODEL']['totalflux']]),
                                             np.bool([0*res['MODEL']['totalflux']]),
                                             0.0*np.array([res['MODEL']['totalflux']])+1,
-                                            medFilt=medFilt)[0]
+                                            medFilt=medFilt, d_wl=res['dWL'])[0]
         if 'totalnflux' in res['MODEL']:
             res['MODEL']['totalnflux'] =_binVec_flag(res['WL'], _WL,
                                             res['MODEL']['totalnflux'],
                                             np.bool(0*res['MODEL']['totalnflux']),
                                             0.0*res['MODEL']['totalflux']+1,
-                                            medFilt=medFilt)
+                                            medFilt=medFilt, d_wl=res['dWL'])
         #print('MODEL:', res['MODEL'].keys())
 
     return res
-
 
 def splitOIbyMJD(oi, dMJD=0):
     """
@@ -1440,7 +1631,7 @@ def wTarg(hdu, targname, targets):
     else:
         return hdu.data['TARGET_ID']==targets[targname]
 
-def _binVec_flag(_wl, WL, T, F, E=None, medFilt=None, retFlag=False, phase=False):
+def _binVec_flag(_wl, WL, T, F, E=None, medFilt=None, retFlag=False, phase=False, d_wl=None):
     """
     _wl: new WL vector
     WL: actual WL vector
@@ -1458,19 +1649,19 @@ def _binVec_flag(_wl, WL, T, F, E=None, medFilt=None, retFlag=False, phase=False
         #flag[i,:] = np.bool_(_binVec(_wl, WL, np.float64(F[i,:]))>2/3)
 
         # -- at least one point in the bin is valid
-        flag[i,:] = ~np.bool_(_binVec(_wl, WL, np.float64(~F[i,:]), phase=phase)>0)
+        flag[i,:] = ~np.bool_(_binVec(_wl, WL, np.float64(~F[i,:]), phase=phase, dx=d_wl)>0)
         if E is None:
-            res[i,:] = _binVec(_wl, WL[w], T[i,:][w], medFilt=medFilt, phase=phase)
+            res[i,:] = _binVec(_wl, WL[w], T[i,:][w], medFilt=medFilt, phase=phase, dx=d_wl)
         else:
             try:
-                res[i,:] = _binVec(_wl, WL[w], T[i,:][w], E=E[i,:][w], medFilt=medFilt, phase=phase)
+                res[i,:] = _binVec(_wl, WL[w], T[i,:][w], E=E[i,:][w], medFilt=medFilt, phase=phase, dx=d_wl)
             except:
                 res[i,:] = np.nan
     if retFlag:
         return res, np.logical_or(flag, np.isnan(res))
     return res
 
-def _binVec(x, X, Y, E=None, medFilt=None, phase=False):
+def _binVec(x, X, Y, E=None, medFilt=None, phase=False, dx=None):
     """
     bin Y(X) with new x. E is optional error bars (or weighting)
     """
@@ -1480,19 +1671,15 @@ def _binVec(x, X, Y, E=None, medFilt=None, phase=False):
     #     Y = np.unwrap(Y, period=360)
     # -- X can be irregular, so traditionnal convolution may not work
     y = np.zeros(len(x))
-    Gx = np.gradient(x)
-    #dx = np.median(np.diff(x))
+    if dx is None:
+        Gx = np.gradient(x)
+    else:
+        Gx = dx
     for i,x0 in enumerate(x):
-        # -- kernel
-        #k = np.exp(-(X-x0)**2/(0.6*dx)**2)
-        k = np.exp(-(X-x0)**2/(0.6*Gx[i])**2)
+        # -- kernel with FWHM of Gx[i]/2
+        k = np.exp(-(X-x0)**2/(2*(0.5*Gx[i]/2.35482)**2))
         no = np.sum(k/E) # normalisation
         if phase:
-            # if no!=0 and np.isfinite(no):
-            #     y[i] = np.sum(k/E*((Y-y[i]+180)%360 - 180 + y[i]))/no
-            # else:
-            #     y[i] = np.sum(k*((Y-y[i]+180)%360 - 180 + y[i]))/np.sum(k)
-
             if no!=0 and np.isfinite(no):
                y[i] = np.angle(np.sum(k/E*np.exp(1j*Y*np.pi/180))/no)*180/np.pi
             else:
@@ -1589,7 +1776,7 @@ def mergeOI(OI, collapse=True, groups=None, verbose=False, debug=False, dMJD=Non
 
             # -- merge data in the extension:
             for k in sorted(oi[l].keys()):
-                # -- for each telescpe / baseline / triangle
+                # -- for each telescope / baseline / triangle
                 if not k in res[i0][l].keys():
                     # -- unknown telescope / baseline / triangle
                     # -- just add it in the the dict
@@ -1656,7 +1843,7 @@ def mergeOI(OI, collapse=True, groups=None, verbose=False, debug=False, dMJD=Non
                             tmp = oi[l][k][t]
                         else:
                             oops = True
-                            #print('!', l, k, t)
+                            #print('! OOPS', l, k, t)
                         if not oops:
                             res[i0][l][k][t] = np.append(res[i0][l][k][t], tmp)
                             try:
@@ -1823,7 +2010,7 @@ def mergeOI(OI, collapse=True, groups=None, verbose=False, debug=False, dMJD=Non
                             tmp[k][p] = r['fit'][k][p]
                         else:
                             tmp[k] = {p:r['fit'][k][p]}
-            r['fit'] = {k:r['fit'][k] for k in ['obs', 'wl ranges', 'baseline ranges',
+            r['fit'] = {k:r['fit'][k] for k in ['obs', 'wl ranges', 'baseline ranges', 'spatial frequency ranges',
                                                 'MJD ranges', 'continuum ranges', 'prior',
                                                 'Nr', 'DPHI order', 'N|V| order', 'NV2 order',
                                                 'NFLUX order', 'ignore negative flux',
@@ -1843,7 +2030,6 @@ def mergeOI(OI, collapse=True, groups=None, verbose=False, debug=False, dMJD=Non
     else:
         return res
 
-
 def averageOI(oi,):
     if type(oi)==list:
         return [averageOI(x) for x in oi]
@@ -1859,7 +2045,7 @@ def averageOI(oi,):
          'OI_T3':{2:['T3PHI', 'T3AMP', 'MJD2', 'Bmax/wl', 'Bmin/wl', 'Bavg/wl'],
                   1:['MJD', 'u1', 'v1', 'u2', 'v2', 'B1', 'B2', 'B3']}
          }
-    res = {k:oi[k] for k in ['WL', 'baselines', 'insname', 'filename', 'fit'] if k in oi}
+    res = {k:oi[k] for k in ['WL', 'dWL', 'baselines', 'insname', 'filename', 'fit'] if k in oi}
 
     maxTimeSpan = 1 # in hours
     if np.std(oi['MJD'])*24>maxTimeSpan:
@@ -2263,12 +2449,16 @@ def getESOPipelineParams(H, verbose=True):
                             'files':F}
                 p = OrderedDict()
             last_rec = rec
-        if H[k.replace('NAME', 'VALUE')]=='true':
+        if H[k.replace('NAME', 'VALUE')].lower()=='true':
             c = '\033[32m'
-        elif H[k.replace('NAME', 'VALUE')]=='false':
+        elif H[k.replace('NAME', 'VALUE')].lower()=='false':
             c = '\033[31m'
         else:
-            c = '\033[34m'
+            try:
+                float(H[k.replace('NAME', 'VALUE')])
+                c = '\033[35m'                
+            except:   
+                c = '\033[34m'
         p[H[k]] = H[k.replace('NAME', 'VALUE')]
         if verbose:
             print(H[k]+'='+c+H[k.replace('NAME', 'VALUE')]+'\033[0m', end=' ')
@@ -2281,3 +2471,83 @@ def getESOPipelineParams(H, verbose=True):
                     'parameters':p,
                     'files':F}
     return P
+
+def quadriphase(D, plot=False, verbose=False, weighted=True):
+    """
+    check redundancy of the closure phases by checking the 4 closures in the 4 trinagles from 4 telescopes.
+    returns the quadriphase, which should be 0
+
+    """
+    B = list(D['baselines'])
+    T = list(D['triangles'])
+    
+    F = {}
+    for t in T:
+        tmp = {}
+        if t[:4] in B:
+            tmp[t[:4]] = 1
+        elif t[2:4]+t[:2] in B:
+            tmp[t[2:4]+t[:2]] = -1
+        
+        if t[-4:] in B:
+            tmp[t[-4:]] = 1
+        elif t[-2:]+t[-4:-2] in B:
+            tmp[t[-2:]+t[-4:-2]] = -1 
+        
+        if t[-2:]+t[:2] in B:
+            tmp[t[-2:]+t[:2]] = 1
+        elif t[:2]+t[-2:] in B:
+            tmp[t[:2]+t[-2:]] = -1
+        F[t] = tmp
+    if verbose:
+        display(F)
+    
+    if plot:
+        plt.close(0); plt.figure(0)
+        plt.close(1); plt.figure(1)
+        # -- check closure formulas from phase
+        for i,k in enumerate(F):
+            plt.subplot(2,2,i+1)
+            plt.title(k)
+            plt.plot(D[k]['T3PHI'][0], '-k')
+            plt.plot(np.sum([F[k][t]*D[t]['PHI'][0] for t in F[k]], axis=0), '-r')
+        plt.tight_layout()
+    
+    quad = {}
+    for q in itertools.combinations(D['telescopes'], 4):
+        # -- find 4 triangles in a quadrilater
+        tris = []
+        for k in F:
+            if k[:2] in q and k[2:4] in q and k[-2:] in q:
+                tris.append(k)
+        if verbose:
+            print(q, end=' -> ')
+        # -- find the 0-formula combining 4 closure phases
+        tmp = {tris[0]:1}
+        for i in range(3):
+            # find common baseline with previous triangle
+            k = [t for t in F[tris[i+1]] if t in F[tris[i]]][0]
+            if F[tris[i+1]][k]*F[tris[i]][k] == -1:
+                tmp[tris[i+1]] = tmp[tris[i]]
+            else:
+                tmp[tris[i+1]] = -tmp[tris[i]]
+        flag = False
+        for k in tmp:
+            flag = np.logical_or(flag, D['OI_T3'][k]['FLAG'])
+        
+        quad[''.join(q)] = {'FLAG':flag}
+        if weighted:
+            quad[''.join(q)]['T4PHI'] = np.sum([tmp[k]*D['OI_T3'][k]['T3PHI']/D['OI_T3'][k]['ET3PHI'] for k in tmp], axis=0)/\
+                                        np.sum([1/D['OI_T3'][k]['ET3PHI'] for k in tmp], axis=0)
+        else:
+            quad[''.join(q)]['T4PHI'] = np.sum([tmp[k]*D['OI_T3'][k]['T3PHI'] for k in tmp], axis=0)
+
+        if verbose:
+            print(tmp)
+        if plot:
+            plt.plot(np.sum(quad[''.join(q)], axis=0), label='-'.join(q))
+    if plot:
+        plt.legend()
+    if not verbose:
+        return quad
+

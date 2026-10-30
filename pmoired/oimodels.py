@@ -1,34 +1,36 @@
-import time
 import copy
-import multiprocessing
-import random
-import os
-import platform, subprocess
 import itertools
-import sys
+import multiprocessing
+import os
 import pickle
-import serial
-
+import platform
+import random
+import subprocess
+import sys
+import time
 import warnings
+
+import serial
 
 warnings.filterwarnings(action="ignore", category=RuntimeWarning)
 
-import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
+import numpy as np
+import scipy.interpolate
+
 # import matplotlib.cm # deprecated in 3.8
 # import matplotlib.colormaps
-
 import scipy.special
-import scipy.interpolate
 import scipy.stats
+
+# import pmoired.ulensBin2 as ulensBin2
+from astropy import constants
 
 import pmoired.dpfit as dpfit
 import pmoired.dw as dw
 import pmoired.oifits as oifits
-# import pmoired.ulensBin2 as ulensBin2
-
-from astropy import constants
+import pmoired.rotastar as rotastar
 
 try:
     import pmoired.microprogress as microprogress
@@ -40,11 +42,24 @@ _c = np.pi**2 / 180 / 3600 / 1000 * 1e6
 # -- default max number of processes
 MAX_THREADS = multiprocessing.cpu_count()
 US_SPELLING = False
+_aknowledge = {'Vkepler':True}
 
+def closefig(fig):
+    # -- helps avoid memory ballooning?
+    if plt.fignum_exists(fig):
+        plt.figure(fig)
+        plt.clf()
+    plt.close(fig)
+    return
 
-def Ssingle(oi, param, noLambda=False):
+def Ssingle(oi, param, noLambda=False, allParams=None, debug=False):
     """
     build spectrum for Vsingle
+
+    oi: data dictionnary
+
+    param: param dictionnary
+
     """
     if not noLambda:
         _param = computeLambdaParams(param, MJD=np.mean(oi["MJD"]))
@@ -61,6 +76,9 @@ def Ssingle(oi, param, noLambda=False):
     elif not "spectrum" in _param and not any([x.startswith("fwvl") for x in _param]):
         # -- no continuum is defined, assumes 1.0
         f += 1.0
+    if debug:
+        print(f"Ssingle {f=}")
+
     # == polynomials ============================
     As = filter(lambda x: x.startswith("f") and x[1:].isdigit(), _param.keys())
     for a in As:
@@ -82,11 +100,7 @@ def Ssingle(oi, param, noLambda=False):
         if "line_" + i + "_lorentzian" in _param.keys():
             dwl = _param["line_" + i + "_lorentzian"]  # in nm
             # f += _param[l]*1/(1+(oi['WL']-wl0)**2/(dwl/1000)**2)
-            f += (
-                _param[l]
-                * (0.5 * dwl / 1000) ** 2
-                / ((oi["WL"] - wl0) ** 2 + (0.5 * dwl / 1000) ** 2)
-            )
+            f += (_param[l]*(0.5*dwl/1000)**2/((oi["WL"]-wl0)**2+(0.5*dwl/1000)**2))
         elif "line_" + i + "_truncexp" in _param.keys():
             dwl = _param["line_" + i + "_truncexp"]  # in nm
             if "line_" + i + "_pow" in _param:
@@ -180,21 +194,45 @@ def Ssingle(oi, param, noLambda=False):
         # if min(X)<min(oi['WL']) or max(X)>max(oi['WL']):
         #    print('WL range !')
         f += np.interp(oi["WL"], X, Y)
-        #f += scipy.interpolate.interp1d(X, Y, kind="quadratic", fill_value="extrapolate")(oi["WL"])
+        # f += scipy.interpolate.interp1d(X, Y, kind="quadratic", fill_value="extrapolate")(oi["WL"])
 
     # == arbitrary, expressed as string ===================
     if "spectrum" in _param.keys():
         sp = _param["spectrum"]
         sp = sp.replace("$WL", 'oi["WL"]')
-        for k in _param.keys():
-            if k in sp:
-                sp.replace("$" + k, str(_param[k]))
+        # while '$' in sp:
+        for j in range(3):
+            # -- iterate a few times for recursive definitions
+            for k in _param.keys():
+                if k in sp and not k.endswith(",spectrum"):
+                    sp.replace("$" + k, str(_param[k]))
+        if not allParams is None:
+            Cs = set([x.split(",")[0] for x in allParams if "," in x])
+            for c in Cs:
+                if "#" + c + ",SPECTRUM" in sp:
+                    tmpp = {x: allParams[x] for x in allParams if not "," in x}
+                    tmpp |= {
+                        x.split(c + ",")[1]: allParams[x]
+                        for x in allParams
+                        if x.startswith(c + ",")
+                    }
+                    # print('#'+c+',SPECTRUM' in sp)
+                    sp = sp.replace(
+                        "#" + c + ",SPECTRUM",
+                        "np.array(" + str(list(Ssingle(oi, tmpp))) + ")",
+                    )
         try:
             f += eval(sp)
         except:
             print("!!! cannot evaluate", sp)
-    return f
+            print(f"{sp=}")
 
+    if "spectrum function" in _param.keys() and "spectrum parameters" in _param.keys():
+        f = _param["spectrum function"](oi["WL"], _param['spectrum parameters'])
+
+    if debug:
+        print(f'Ssingle: {f=}')
+    return np.nan_to_num(f)
 
 def _Kepler3rdLaw(a=None, P=None, M1M2=None):
     """
@@ -582,7 +620,6 @@ def _expandVec(x, n: int, dx=None):
         res = np.linspace(x - dx / 2, x + dx / 2, 2 * n + 1)
     return res
 
-
 def VsingleOI(
     oi,
     param,
@@ -597,6 +634,8 @@ def VsingleOI(
     _ffrac=1.0,
     _dwl=0.0,
     fullOutput=False,
+    allParams=None,
+    debug=False,
 ):
     """
     build copy of OI, compute VIS, VIS2 and T3 for a single object parametrized
@@ -705,27 +744,39 @@ def VsingleOI(
     else:
         smear = None
 
-    _debug = False
+    if ("fit" in oi
+        and "ignore negative flux" in oi["fit"]
+        and oi["fit"]["ignore negative flux"]
+        ):
+        ignoreNegativeFlux = True
+    else:
+        ignoreNegativeFlux = False
+
+
     # -- copy u,v, etc, exampdin WL range in case of smearing
 
     if not smear is None:
-        _debug = False
-        if _debug:
-            print("DBG> VsingleOI: init smearing")
+        if debug:
+            print("VsingleOI: init smearing WL [%d]" % len(res["WL"]), end=" -> ")
         # expand the WL table -> re bin *after* combining components!
         res["binWL"] = res["WL"] * 1.0
         # res['WL'] = np.linspace(res['WL'].min(), res['WL'].max(), len(res['WL'])*smear)
         # res['WL'] = np.linspace(res['WL'][0], res['WL'][-1], len(res['WL'])*smear)
+        test = False
+       
         if len(res["WL"]) == 1:
-            res["WL"] = _expandVec(res["WL"][0], smear - 1, dx=res["dWL"][0])
+            res["WL"] = _expandVec([res["WL"][0]], smear - 1, dx=oi["dWL"][0])[:,0]
         else:
             res["WL"] = _expandVec(res["WL"], smear - 1)
-
+        if debug:
+            print("VsingleOI: [%d]" % len(res["WL"]))
             # print('')
-        if not "dWL" in res:
-            res["dWL"] = np.gradient(res["WL"])
-        else:
-            res["dWL"] = np.interp(res["WL"], _WL, res["dWL"])
+
+        #if not "dWL" in res:
+        #    res["dWL"] = np.gradient(res["WL"])
+        #else:
+        res["dWL"] = np.interp(res["WL"], res["binWL"], oi["dWL"])/smear
+
 
     if "OI_FLUX" in oi:
         res["OI_FLUX"] = {}
@@ -755,6 +806,7 @@ def VsingleOI(
                     np.sqrt(oi[e][k]["u"][:, None] ** 2 + oi[e][k]["v"][:, None] ** 2)
                     / res["WL"][None, :]
                 )
+
     if "OI_T3" in oi:
         res["OI_T3"] = {}
         for k in oi["OI_T3"]:
@@ -821,21 +873,19 @@ def VsingleOI(
 
     # -- spectrum, fraction of it if needed for bandwith smearing
     # -- vector, same length as oi['WL']
-    flux = Ssingle(res, _param, noLambda=True) * _ffrac
-
+    flux = Ssingle(res, _param, noLambda=True, allParams=allParams, debug=debug) * _ffrac
+    if debug:
+        print(f"VsingleOI: {_param=}")
+        print(f"VsingleOI: {flux=}")
     if any(flux > 0):
         # -- check negativity of spectrum
-        negativity = np.sum(flux[flux < 0]) / np.sum(flux[flux >= 0])
+        negativity = 100 * np.sum(flux[flux < 0]) / np.sum(flux[flux >= 0])
     elif all(flux < 0):
         negativity = np.sum(flux[flux < 0])
     else:
         negativity = 0
 
-    if (
-        "fit" in oi
-        and "ignore negative flux" in oi["fit"]
-        and oi["fit"]["ignore negative flux"]
-    ):
+    if ignoreNegativeFlux:
         negativity = 0.0
 
     if timeit:
@@ -902,10 +952,10 @@ def VsingleOI(
 
     # -- user-defined wavelength range
     delta = 0
-    if 'fit' in oi and 'wl kernel' in oi['fit']:
-        delta = 3*oi["fit"]['wl kernel']*np.abs(np.mean(np.diff(res['WL'])))
-    if 'fit' in oi and 'smear' in oi['fit']:
-        delta = 3*oi["fit"]['smear']*np.abs(np.mean(np.diff(res['WL'])))
+    if "fit" in oi and "wl kernel" in oi["fit"]:
+        delta = 3 * oi["fit"]["wl kernel"] * np.abs(np.mean(np.diff(res["WL"])))
+    if "fit" in oi and "smear" in oi["fit"]:
+        delta = 3 * oi["fit"]["smear"] * np.abs(np.mean(np.diff(res["WL"])))
 
     if "fit" in oi and "wl ranges" in oi["fit"]:
         WLR = oi["fit"]["wl ranges"]
@@ -923,36 +973,42 @@ def VsingleOI(
     # -- do we need to apply a stretch?
     if "projang" in _param.keys() and "incl" in _param.keys():
         rot = -_param["projang"] * np.pi / 180
-        _uwl = lambda z: np.cos(_param["incl"] * np.pi / 180) * (
-            np.cos(rot) * z["u/wl"][:, wwl] / cwl
-            + np.sin(rot) * z["v/wl"][:, wwl] / cwl
+        _uwl = lambda z: (
+            np.cos(_param["incl"] * np.pi / 180)
+            * (
+                np.cos(rot) * z["u/wl"][:, wwl] / cwl
+                + np.sin(rot) * z["v/wl"][:, wwl] / cwl
+            )
         )
-        _vwl = (
-            lambda z: -np.sin(rot) * z["u/wl"][:, wwl] / cwl
+        _vwl = lambda z: (
+            -np.sin(rot) * z["u/wl"][:, wwl] / cwl
             + np.cos(rot) * z["v/wl"][:, wwl] / cwl
         )
         _Bwl = lambda z: np.sqrt(_uwl(z) ** 2 + _vwl(z) ** 2)
 
         if du:
-            _udu = (
-                lambda z: (
+            _udu = lambda z: (
+                (
                     np.cos(rot) * z["u/wl"][:, wwl] / cwl
                     + np.sin(rot) * z["v/wl"][:, wwl] / cwl
                 )
                 * np.cos(np.pi * _param["incl"] / 180)
                 + du / res["WL"][wwl]
             )
-            _vdu = (
-                lambda z: -np.sin(rot) * z["u/wl"][:, wwl] / cwl
+            _vdu = lambda z: (
+                -np.sin(rot) * z["u/wl"][:, wwl] / cwl
                 + np.cos(rot) * z["v/wl"][:, wwl] / cwl
             )
             _Bdu = lambda z: np.sqrt(_udu(z) ** 2 + _vdu(z) ** 2)
             _udv = lambda z: (
-                np.cos(rot) * z["u/wl"][:, wwl] / cwl
-                + np.sin(rot) * z["v/wl"][:, wwl] / cwl
-            ) * np.cos(np.pi * _param["incl"] / 180)
-            _vdv = (
-                lambda z: -np.sin(rot) * z["u/wl"][:, wwl] / cwl
+                (
+                    np.cos(rot) * z["u/wl"][:, wwl] / cwl
+                    + np.sin(rot) * z["v/wl"][:, wwl] / cwl
+                )
+                * np.cos(np.pi * _param["incl"] / 180)
+            )
+            _vdv = lambda z: (
+                -np.sin(rot) * z["u/wl"][:, wwl] / cwl
                 + np.cos(rot) * z["v/wl"][:, wwl] / cwl
                 + dv / res["WL"][wwl]
             )
@@ -997,24 +1053,20 @@ def VsingleOI(
 
             R = np.sqrt(_X**2 + _Y**2)
 
-    # -- phase offset
+    # -- phase offset due to position in the field
     # phi = lambda z: -2j*_c*(z['u/wl']*x+z['v/wl']*y)
-    PHI = lambda o: np.exp(-2j*_c* (o["u/wl"][:, wwl] / cwl * x(o)[:, wwl]
-                                  + o["v/wl"][:, wwl] / cwl * y(o)[:, wwl]))
+    PHI = lambda o: np.exp(-2j*_c*(o["u/wl"][:, wwl] / cwl * x(o)[:, wwl]+ 
+                                   o["v/wl"][:, wwl] / cwl * y(o)[:, wwl]))
 
     if du:
         # dPHIdu = lambda z: -2j*_c*x*PHI(z)/oi['WL']
         # dPHIdv = lambda z: -2j*_c*y*PHI(z)/oi['WL']
-        PHIdu = lambda o: np.exp(-2j*_c*((o["u/wl"][:, wwl] / cwl + du / res["WL"][:, wwl]) * x(o)[:, wwl]
-                                        + o["v/wl"][:, wwl] / cwl * y(o)[:, wwl]))
-        PHIdv = lambda o: np.exp(
-            -2j
-            * _c
-            * (
+        PHIdu = lambda o: np.exp(-2j*_c*(
+                (o["u/wl"][:, wwl] / cwl + du / res["WL"][:, wwl]) * x(o)[:, wwl]
+                + o["v/wl"][:, wwl] / cwl * y(o)[:, wwl]))
+        PHIdv = lambda o: np.exp(-2j*_c*(
                 o["u/wl"][:, wwl] / cwl * x(o)[:, wwl]
-                + (o["v/wl"][:, wwl] / cwl + dv / res["WL"][wwl]) * y(o)[:, wwl]
-            )
-        )
+                + (o["v/wl"][:, wwl] / cwl + dv / res["WL"][wwl]) * y(o)[:, wwl]))
 
     # -- guess which visibility function
     if "sparse" in _param:
@@ -1046,9 +1098,8 @@ def VsingleOI(
                 imN=imN,
             )
             I = tmp[1] / np.sum(tmp[1])
-    elif (
-        "Vin" in _param or "V1mas" in _param or "Vin_Mm/s" in _param
-    ):  # == Keplerian disk ==
+    elif ("Vin" in _param or "V1mas" in _param or "Vin_Mm/s" in _param):  
+        # == Keplerian disk ==
         # == TODO: make this faster by only computing for needed wavelength
         if imFov is None:
             imN = None
@@ -1078,14 +1129,51 @@ def VsingleOI(
         # -- TEST
         # kt = list(oi['OI_VIS2'].keys())[0]
         # print('test', kt, np.abs(Vf(oi['OI_VIS2'][kt])))
+    elif "Rpole" in _param or "Tpole" in _param or 'diampole' in _param or 'diameq' in _param:
+        # -- rotating star
+        if imFov is None:
+            imN = None
+        else:
+            imN = int(np.sqrt(len(X.flatten())))
+        #print(f"VsingleOI: rotastar {imFov=}")
+        tmp = rotastar.Vrota(
+            np.array([1]),
+            np.array([1]),
+            res["WL"][wwl],
+            _param,
+            fullOutput=True,
+            imFov=imFov,
+            imPix=imPix,
+            imX=imX,
+            imY=imY,
+            imN=imN,
+        )
+        # -- tmp[1] -> SED 
+        # -- tmp[5] -> spectral lines
+        #flux = np.zeros(len(res["WL"]))
+        #flux[wwl] = tmp[1]*tmp[5]
+
+        # -- use usual spectrum and add photospheric lines
+        flux[wwl] *= tmp[5]
+
+        if not I is None:
+            # print('shape', tmp[4].shape)
+            I = np.zeros((len(res["WL"]), tmp[4].shape[1], tmp[4].shape[2]))
+            I[wwl, :, :] = tmp[4]
+            I *= np.sum(flux[:, None, None]) / np.sum(I)
+        # for k in oi['OI_VIS']:
+        #     print(f'DBG> {oi["OI_VIS"][k]["u"].shape=}')
+        # for k in oi['OI_VIS2']:
+        #     print(f'DBG> {oi["OI_VIS2"][k]["u"].shape=}')
+
+        Vf = lambda z: rotastar.Vrota(z["u"].flatten(), z["v"].flatten(), res["WL"][wwl], _param)
+
     elif "ud" in _param.keys():  # == uniform disk ================================
         Rout = _param["ud"] / 2
-        if any(flux > 0):
-            Vf = (
-                lambda z: 2
-                * scipy.special.j1(_c * _param["ud"] * _Bwl(z) + 1e-12)
-                / (_c * _param["ud"] * _Bwl(z) + 1e-12)
-            )
+        if any(flux > 0) or ignoreNegativeFlux:
+            Vf = lambda z: (
+                2*scipy.special.j1(_c * _param["ud"] * _Bwl(z) + 1e-12)
+                / (_c * _param["ud"] * _Bwl(z) + 1e-12))
         else:
             # -- save time
             Vf = lambda z: np.zeros(_Bwl(z).shape)
@@ -1094,13 +1182,13 @@ def VsingleOI(
             negativity += np.abs(_c * _param["ud"] * Bwlmax)
 
         if du:  # -- slanted
-            Vfdu = (
-                lambda z: 2
+            Vfdu = lambda z: (
+                2
                 * scipy.special.j1(_c * _param["ud"] * _Bdu(z))
                 / (_c * _param["ud"] * _Bdu(z))
             )
-            Vfdv = (
-                lambda z: 2
+            Vfdv = lambda z: (
+                2
                 * scipy.special.j1(_c * _param["ud"] * _Bdv(z))
                 / (_c * _param["ud"] * _Bdv(z))
             )
@@ -1130,7 +1218,7 @@ def VsingleOI(
             a = None
             Vf = lambda z: 1 + 0 * _Bwl(z)
 
-        if not any(flux > 0):
+        if not any(flux > 0) or ignoreNegativeFlux:
             # -- save time
             Vf = lambda z: np.zeros(_Bwl(z).shape)
 
@@ -1209,12 +1297,14 @@ def VsingleOI(
                     I = R2 == np.min(R2)
         else:
             Vf = lambda z: (
-                1 / aou * np.exp(-((_c * _Bwl(z)) ** 2) / aou)
-                - 1 / ain * np.exp(-((_c * _Bwl(z)) ** 2) / ain)
-            ) / (1 / aou - 1 / ain)
+                (
+                    1 / aou * np.exp(-((_c * _Bwl(z)) ** 2) / aou)
+                    - 1 / ain * np.exp(-((_c * _Bwl(z)) ** 2) / ain)
+                )
+                / (1 / aou - 1 / ain)
+            )
             if not I is None:
                 I = np.exp(-(R**2) * aou) - np.exp(-(R**2) * ain)
-
     elif "crin" in _param and "crout" in _param and "croff" in _param:  # crecsent
         # print('crescent')
         # if _param['crin']>_param['crout']:
@@ -1247,17 +1337,20 @@ def VsingleOI(
             _offYi = _off * np.cos(crpa)
 
         Vf = lambda z: (
-            np.exp(-2j * _c * _uwl(z) * _offXo - 2j * _c * _vwl(z) * _offYo)
-            * _crout**2
-            * 2
-            * scipy.special.j1(_c * _crout * _Bwl(z) + 1e-12)
-            / (_c * _crout * _Bwl(z) + 1e-12)
-            - np.exp(-2j * _c * _uwl(z) * _offXi - 2j * _c * _vwl(z) * _offYi)
-            * _crin**2
-            * 2
-            * scipy.special.j1(_c * _crin * _Bwl(z) + 1e-12)
-            / (_c * _crin * _Bwl(z) + 1e-12)
-        ) / (_crout**2 - _crin**2)
+            (
+                np.exp(-2j * _c * _uwl(z) * _offXo - 2j * _c * _vwl(z) * _offYo)
+                * _crout**2
+                * 2
+                * scipy.special.j1(_c * _crout * _Bwl(z) + 1e-12)
+                / (_c * _crout * _Bwl(z) + 1e-12)
+                - np.exp(-2j * _c * _uwl(z) * _offXi - 2j * _c * _vwl(z) * _offYi)
+                * _crin**2
+                * 2
+                * scipy.special.j1(_c * _crin * _Bwl(z) + 1e-12)
+                / (_c * _crin * _Bwl(z) + 1e-12)
+            )
+            / (_crout**2 - _crin**2)
+        )
         if not I is None:
             # -- outer disk
             R2 = (_X - _offXo) ** 2 + (_Y - _offYo) ** 2
@@ -1276,6 +1369,7 @@ def VsingleOI(
                 flux *= np.ones(len(res["WL"])) * _param["surf bri"]
             else:
                 flux *= eval(_param["surf bri"].replace("$WL", 'res["WL"]'))
+
             if any(flux > 0):
                 # -- check negativity of spectrum
                 negativity = np.sum(flux[flux < 0]) / np.sum(flux[flux >= 0])
@@ -1289,9 +1383,8 @@ def VsingleOI(
                 and oi["fit"]["ignore negative flux"]
             ):
                 negativity = 0.0
-    elif (
-        "diamout" in _param or "diam" in _param
-    ):  # == F(r)*G(az) ========================
+    elif "diamout" in _param or "diam" in _param:
+        # == F(r)*G(az) ========================
         # -- disk or ring with radial and az profile
 
         if not "diamin" in _param and not "thick" in _param:
@@ -1376,14 +1469,9 @@ def VsingleOI(
                 negativity += np.sum(flux[flux < 0])
             else:
                 negativity += 0
-            if (
-                "fit" in oi
-                and "ignore negative flux" in oi["fit"]
-                and oi["fit"]["ignore negative flux"]
-            ):
-                negativity = 0.0
-
+            
         negativity += np.sum(flux) * _negativityAzvar(_n, _phi, _amp)
+
         Vf = lambda z: _Vazvar(
             z["u/wl"][:, wwl] / cwl,
             z["v/wl"][:, wwl] / cwl,
@@ -1395,7 +1483,13 @@ def VsingleOI(
             stretch=stretch,
         )
 
-        if not any(flux > 0):
+        if ignoreNegativeFlux:
+            negativity = 0.0
+            if debug:
+                print(f"Vsingle: ignoring negative flux")    
+        elif not any(flux > 0):
+            if debug:
+                print(f"Vsingle: negative flux! setting V to 0")    
             # -- save time
             Vf = lambda z: np.zeros(_Bwl(z).shape)
 
@@ -1490,7 +1584,6 @@ def VsingleOI(
                 imN=imN,
             )
             I = tmp[1]  # /np.sum(tmp[1])
-
     else:
         # -- default == fully resolved flux == zero visibility
         Vf = lambda z: np.zeros(_Bwl(z).shape)
@@ -1560,15 +1653,17 @@ def VsingleOI(
             # -- convolve image by spatial kernel
             if not imFov is None:
                 ker = (1 - fLor) * ker + fLor * kfwhm / (2 * np.pi * np.sqrt(3)) * (
-                    kfwhm**2 / 3 + r2 ) ** (-3 / 2)
+                    kfwhm**2 / 3 + r2
+                ) ** (-3 / 2)
         else:
             fLor = 0
             _kl = 1
         if not imFov is None:
             if len(I.shape) == 3:
-                print("fftconvolve", I.shape, ker.shape)
+                #print("fftconvolve", I.shape, ker.shape)
                 I = scipy.signal.fftconvolve(
-                    I, ker[None, :, :], mode="same", axes=(1, 2))
+                    I, ker[None, :, :], mode="same", axes=(1, 2)
+                )
                 I /= np.sum(ker)
             else:
                 I = scipy.signal.fftconvolve(I, ker, mode="same")
@@ -1606,10 +1701,12 @@ def VsingleOI(
                 / Rout
                 * dVdv
             )
+            # -- this takes care of the x,y shift
             V[:, wwl] *= PHI(res[key][k])
         else:
-            # print('debug: MJD=%.3f, X=%.3f, Y=%.3f'%(np.mean(oi[key][k]['MJD']),
-            #                    np.mean(x(oi[key][k])), np.mean(y(oi[key][k]))))
+            #print({x:_param[x] for x in _param if not x.startswith('#TF')}, 
+            #        k, key, np.mean(PHI(res[key][k])))
+            # -- this takes care of the x,y shift
             V[:, wwl] = Vf(res[key][k]) * PHI(res[key][k])
 
         if not kfwhm is None:
@@ -1781,7 +1878,7 @@ def VsingleOI(
     res["param"] = param
 
     if not smear is None:
-        if _debug:
+        if debug:
             print("DBG> closing smearing")
             if not k in res["OI_VIS2"].keys():
                 k = list(res["OI_VIS2"].keys())[0]
@@ -1794,13 +1891,14 @@ def VsingleOI(
             print("DBG> res.keys()", res.keys())
         # -- should de-bin after combining components!
         res["smear"] = smear
-        if _debug:
+        if debug:
             print(
                 "DBG> OI_VIS2[V2]",
                 k,
                 res["OI_VIS2"][k]["V2"].shape,
                 np.min(res["OI_VIS2"][k]["V2"]),
             )
+        debug=False
     return res
 
 
@@ -2068,11 +2166,13 @@ def Vkepler(
     imN=None,
 ):
     """
-    _fudge=1.5, _p=1.5
-
     complex visibility of keplerian disk:
     u, v: 1D-ndarray spatial frequency (m). u and v must have same length N
     wl: 1D-ndarray wavelength (um). can have a different length from u and v
+
+    adapted from: 
+    Delaa+2011: https://ui.adsabs.harvard.edu/abs/2011A%26A...529A..87D/abstract
+    Meilland+2012: https://ui.adsabs.harvard.edu/abs/2012A%26A...538A.110M/abstract
 
     param: parameters of disk:
         Geometry:
@@ -2104,8 +2204,21 @@ def Vkepler(
 
     returns:
     nd.array of shape (N,M) of complex visibilities
+
+    model in global "P":
+    # -- x_mas, y, z, vx_km/s, vy, vz, rmin/r, PA, surface area
+    # -- 0      1  2  3        4   5   6       7   8
+
     """
-    global P
+    global P, _aknowledge
+    if _aknowledge['Vkepler']:
+        print('\033[97m-- Please aknowledge the use the Keplerian model', '-'*11)
+        print('Keplerian model initially developped for Be stars by:')
+        print(r' Delaa+2011: https://ui.adsabs.harvard.edu/abs/2011A%26A...529A..87D/abstract')
+        print(r' Meilland+2012: https://ui.adsabs.harvard.edu/abs/2012A%26A...538A.110M/abstract')
+        print('-'*51, '\033[0m')
+        _aknowledge['Vkepler'] = False
+
     t0 = time.time()
     u = np.array(u)
     v = np.array(v)
@@ -2181,19 +2294,11 @@ def Vkepler(
     tmp = []
     for a in As:
         if a.replace("wl0", "gaussian") in param:
-            tmp.append(
-                param[a]
-                * np.sqrt(Vin**2 + Vrad**2)
-                / 2.998e5
-                / max(param[a.replace("wl0", "gaussian")] / 1000, obs_dwl)
+            tmp.append(param[a]*np.sqrt(Vin**2 + Vrad**2)/2.998e5/max(param[a.replace("wl0", "gaussian")]/1000, obs_dwl)
             )
         elif a.replace("wl0", "lorentzian") in param:
             tmp.append(
-                0.5
-                * param[a]
-                * np.sqrt(Vin**2 + Vrad**2)
-                / 2.998e5
-                / max(param[a.replace("wl0", "lorentzian")] / 1000, obs_dwl)
+                0.5*param[a]*np.sqrt(Vin**2 + Vrad**2)/2.998e5/max(param[a.replace("wl0", "lorentzian")]/1000, obs_dwl)
             )
         else:
             # -- default gaussian profile based on spectral resolution
@@ -2282,16 +2387,8 @@ def Vkepler(
     if len(v.shape) > 1:
         v = v.flatten()
 
-    Vpoints = np.exp(
-        -2j
-        * np.pi
-        * c
-        * (
-            u[:, None, None] * P[:, 0][None, None, :]
-            + v[:, None, None] * P[:, 1][None, None, :]
-        )
-        / wl[None, :, None]
-    )
+    Vpoints = np.exp(-2j*np.pi*c*(u[:,None,None]*P[:,0][None,None,:]
+                                + v[:,None,None]*P[:, 1][None,None,:])/wl[None,:,None])
     # print(P.shape, Vpoints.shape)
     flux = np.zeros((len(wl), P.shape[0]))
     # -- continuum
@@ -2333,8 +2430,8 @@ def Vkepler(
     # -- lines profiles:
     # loren = lambda x, wl0, dwl: 1/(1+(x-wl0)**2/maximum(dwl/1000, obs_dwl/2)**2)
     # gauss = lambda x, wl0, dwl: np.exp(-(x-wl0)**2/(2*(np.maximum(dwl/1000, obs_dwl)/2.35482)**2))
-    loren = lambda x, wl0, dwl: (0.5 * dwl / 1000) ** 2 / (
-        (x - wl0) ** 2 + (0.5 * dwl / 1000) ** 2
+    loren = lambda x, wl0, dwl: (
+        (0.5 * dwl / 1000) ** 2 / ((x - wl0) ** 2 + (0.5 * dwl / 1000) ** 2)
     )
     gauss = lambda x, wl0, dwl: np.exp(
         -((x - wl0) ** 2) / (2 * dwl / 1000 / 2.35482) ** 2
@@ -2446,6 +2543,7 @@ def Vkepler(
     else:
         x, y = 0, 0
 
+    # -- are we taking this into account twice !?
     vis *= np.exp(
         -2j * c * (u[:, None] / wl[None, :] * x + v[:, None] / wl[None, :] * y)
     )
@@ -2455,7 +2553,8 @@ def Vkepler(
     #        '%.0fms'%(1000*(t1-t0)), ' + %.0fms'%(1000*(time.time()-t1)) )
 
     if plot:
-        plt.close(0)
+        # -- helps avoid memory ballooning?
+        closefig(0)
         plt.figure(0)
         ax = plt.subplot(211, aspect="equal")
         # -- show disk' dots on sky, with color is the velocit
@@ -2528,6 +2627,7 @@ def Vkepler(
 
     if fullOutput:
         # -- visibility, total spectrum, x, y, cube, points in disk
+        #       0.   1.   2.  3.   4.  5.  6
         return vis, flx, _X, _Y, cube, P, flux
     else:
         # -- only (complex) visibility
@@ -2597,7 +2697,6 @@ def VfromImageOI(oi):
 
 SMEA = 7
 
-
 def VmodelOI(
     oi,
     p,
@@ -2607,7 +2706,6 @@ def VmodelOI(
     imY=0.0,
     timeit=False,
     indent=0,
-    v2smear=True,
     fullOutput=False,
     debug=False,
     asTemplate=False,
@@ -2628,7 +2726,6 @@ def VmodelOI(
                 timeit=timeit,
                 indent=indent,
                 fullOutput=fullOutput,
-                v2smear=v2smear,
                 debug=debug,
                 asTemplate=asTemplate,
             )
@@ -2657,11 +2754,48 @@ def VmodelOI(
             timeit=timeit,
             indent=indent + 1,
             fullOutput=fullOutput,
+            allParams=param,
+            debug=debug
         )
 
-        # -- apply before differential computations:
-        res = _applyWlKernel(res, debug=debug, fullWlRange=True)
-        res = _applyTF(res)
+        if "smear" in res:
+            debug=False
+            if debug:
+                print('DBG> smearing: rebinning data for single component')
+                if 'OI_T3' in res:
+                    T3ptp_1 = {}
+                    if list(res['OI_T3'].keys())==['all']:
+                        for k in set(res['OI_T3']['all']['NAME']):
+                            w = res['OI_T3']['all']['NAME']==k
+                            T3ptp_1[k] = np.ptp(res['OI_T3']['all']['T3PHI'][w])
+                    else:
+                        for k in set(res['OI_T3']):
+                            T3ptp_1[k] = np.ptp(res['OI_T3'][k]['T3PHI'][w])
+
+            if 'fit' in res and 'wl kernel' in res['fit']:
+                wlKernel = np.abs(res['fit']['wl kernel'])
+            else:
+                wlKernel = 0
+            if wlKernel>0:
+                res = _applyWlKernel(res, wlKernel=res['smear']*wlKernel)
+            res = oifits._binOI(res, binning=res["smear"], noError=True)
+            if debug:
+                if 'OI_T3' in res:
+                    T3ptp_2 = {}
+                    if list(res['OI_T3'].keys())==['all']:
+                        for k in set(res['OI_T3']['all']['NAME']):
+                            w = res['OI_T3']['all']['NAME']==k
+                            T3ptp_2[k] = np.ptp(res['OI_T3']['all']['T3PHI'][w])
+                    else:
+                        for k in set(res['OI_T3']):
+                            T3ptp_2[k] = np.ptp(res['OI_T3'][k]['T3PHI'][w])
+                    for k in sorted(T3ptp_1):
+                        print(k, f"{T3ptp_1[k]:.2f} -> {T3ptp_2[k]:.2f}")
+        else:
+            # -- apply before differential computations:
+            res = _applyWlKernel(res, debug=debug, fullWlRange=True)
+    
+        res = oifits._applyTF(res)
 
         if (
             "fit" in oi
@@ -2690,9 +2824,6 @@ def VmodelOI(
                     " " * indent
                     + "VmodelOI > normFlux %.3fms" % (1000 * (time.time() - t0))
                 )
-
-        if "smear" in res:
-            res = oifits._binOI(res, binning=res["smear"], noError=True)
 
         if asTemplate:
             res = _asTemplate(res, oi)
@@ -2829,6 +2960,8 @@ def VmodelOI(
                 _dwl=_dwl,
                 _ffrac=_ffrac,
                 fullOutput=fullOutput,
+                allParams=param,
+                debug=debug
             )
             if _dwl != 0:
                 # -- correct wavelength offset
@@ -2917,6 +3050,7 @@ def VmodelOI(
                 noT3=True,
                 _dwl=_dwl,
                 _ffrac=_ffrac,
+                allParams=param,
             )
             if "image" in m["MODEL"].keys():
                 res["MODEL"][c + ",image"] = m["MODEL"]["image"]
@@ -3053,15 +3187,8 @@ def VmodelOI(
             print(
                 " " * indent + "VmodelOI > fluxes %.3fms" % (1000 * (time.time() - t0))
             )
-    t0 = time.time()
 
-    if "smear" in res:
-        # needs to happen before T3PHI, differential phase and normalise flux
-        if debug:
-            print("VmodelOI: closing smearing (binning)")
-        # print('smear: binning', res['WL'].shape, '->', end=' ')
-        res = oifits._binOI(res, noError=True)
-        # print(res['WL'].shape)
+    t0 = time.time()
 
     if "OI_T3" in oi.keys():
         res["OI_T3"] = {}
@@ -3090,8 +3217,8 @@ def VmodelOI(
             if "NAME" in oi["OI_T3"][k]:
                 res["OI_T3"][k]["NAME"] = oi["OI_T3"][k]["NAME"].copy()
             res["OI_T3"][k]["FLAG"] = np.bool(
-                0 * res["OI_T3"][k]["MJD"][:, None] + 0 * res["WL"][None, :]
-            )
+                0 * res["OI_T3"][k]["MJD"][:, None] + 0 * res["WL"][None, :])
+            res["OI_T3"][k]["MJD2"] = res["OI_T3"][k]["MJD"][:, None] + 0*res['WL'][None,:]
 
         if debug:
             print("VmodelOI: computing T3")
@@ -3101,20 +3228,59 @@ def VmodelOI(
         if timeit:
             print(" " * indent + "VmodelOI > T3 %.3fms" % (1000 * (time.time() - t0)))
 
-    # -- must be before computeDiffPhiOI and computeNormFluxOI
-    res = _applyWlKernel(res, debug=debug, fullWlRange=True)
-    res = _applyTF(res)
+    if "smear" in res:
+        debug=False
+        # needs to happen before T3PHI, differential phase and normalise flux
+        if debug:
+            print(f"VmodelOI: closing smearing  {res['smear']} WL [{len(res['WL'])}] ->", end=' ')
+            if 'OI_T3' in res:
+                T3ptp_1 = {}
+                if list(res['OI_T3'].keys())==['all']:
+                    for k in set(res['OI_T3']['all']['NAME']):
+                        w = res['OI_T3']['all']['NAME']==k
+                        T3ptp_1[k] = np.ptp(res['OI_T3']['all']['T3PHI'][w])
+                else:
+                    for k in set(res['OI_T3']):
+                        T3ptp_1[k] = np.ptp(res['OI_T3'][k]['T3PHI'][w])
+
+        if 'fit' in res and 'wl kernel' in res['fit']:
+            # -- kernel expressed in orginal wavelength resolution 
+            wlKernel = res['fit']['wl kernel']
+        else:
+            wlKernel = 0
+        if wlKernel>0:
+            res = _applyWlKernel(res, wlKernel=res["smear"]*wlKernel)
+
+        # _k0 = list(res['OI_VIS'].keys())[0]
+        # print(f"!! {res['OI_VIS'][_k0]['|V|'].shape=}")
+        # print(f"!! {res['OI_VIS'][_k0]['FLAG'].shape=}")
+        # print(f"!! {res['WL'].shape=}, {res['TELLURICS'].shape=}")        
+        res = oifits._binOI(res, binning=res["smear"], noError=True)
+
+        if debug:
+            print(f"[{len(res['WL'])}]")
+            if 'OI_T3' in res:
+                T3ptp_2 = {}
+                if list(res['OI_T3'].keys())==['all']:
+                    for k in set(res['OI_T3']['all']['NAME']):
+                        w = res['OI_T3']['all']['NAME']==k
+                        T3ptp_2[k] = np.ptp(res['OI_T3']['all']['T3PHI'][w])
+                else:
+                    for k in set(res['OI_T3']):
+                        T3ptp_2[k] = np.ptp(res['OI_T3'][k]['T3PHI'][w])
+            for k in sorted(T3ptp_1):
+                print(k, f"{T3ptp_1[k]:.2f} -> {T3ptp_2[k]:.2f}")
+        debug=False
+    else:
+        # -- must be before computeDiffPhiOI and computeNormFluxOI
+        # -- was already done in smearing above
+        res = _applyWlKernel(res, debug=debug, fullWlRange=True)
+
+    res = oifits._applyTF(res)
 
     t0 = time.time()
-    if (
-        "fit" in oi
-        and "obs" in oi["fit"]
-        and (
-            "DPHI" in oi["fit"]["obs"]
-            or "N|V|" in oi["fit"]["obs"]
-            or "NV2" in oi["fit"]["obs"]
-        )
-    ):
+    if ("fit" in oi and "obs" in oi["fit"] and 
+        ("DPHI" in oi["fit"]["obs"] or "N|V|" in oi["fit"]["obs"] or "NV2" in oi["fit"]["obs"]) ):
         if debug:
             print("VmodelOI: differential phase")
         res = computeDiffPhiOI(res, param, debug=debug)
@@ -3148,45 +3314,102 @@ def VmodelOI(
         res = _asTemplate(res, oi)
     return res
 
+
 def _asTemplate(res, oi):
-    E = {'OI_FLUX':['FLUX'],
-         'OI_VIS':['|V|', 'PHI'],
-         'OI_VIS2':['V2'],
-         'OI_T3':['T3PHI', 'T3AMP'],
-         'OI_CF':['CF'],
+    E = {
+        "OI_FLUX": ["FLUX"],
+        "OI_VIS": ["|V|", "PHI"],
+        "OI_VIS2": ["V2"],
+        "OI_T3": ["T3PHI", "T3AMP"],
+        "OI_CF": ["CF"],
     }
     for e in E:
         if not e in res:
             continue
         for k in res[e]:
-            res[e][k]['FLAG'] = oi[e][k]['FLAG'].copy()
+            res[e][k]["FLAG"] = oi[e][k]["FLAG"].copy()
             for o in E[e]:
                 if not o in res[e][k]:
                     continue
-                res[e][k]['E'+o] = oi[e][k]['E'+o].copy()
-                res[e][k][o] += np.random.randn(*res[e][k][o].shape)*res[e][k]['E'+o]
+                res[e][k]["E" + o] = oi[e][k]["E" + o].copy()
+                res[e][k][o] += (
+                    np.random.randn(*res[e][k][o].shape) * res[e][k]["E" + o]
+                )
+    return res
+
+def _injectFeatures(oi, truth, inject):
+    """
+    oi: an oidata dict or a list thereof
+    truth: parametric model representing the truth
+    inject: additional/modified parameters for the model
+
+    return a data dict/list: "data - model(truth) + model(truth|inject)"
+    """
+    if type(oi) == list:
+        return [_injectFeatures(x, truth, inject) for x in oi]
+
+    E = {
+        "OI_FLUX": ["FLUX"],
+        "OI_VIS": ["|V|", "PHI"],
+        "OI_VIS2": ["V2"],
+        "OI_CF": ["CF"],
+        "OI_T3": ["T3PHI", "T3AMP"],
+    }
+
+    res = {
+        k: oi[k]
+        for k in [
+            "WL",
+            "baselines",
+            "insname",
+            "configurations per MJD",
+            "filename",
+            "fit",
+            "MJD",
+        ]
+        if k in oi
+    }
+
+    T = VmodelOI(oi, truth)
+    I = VmodelOI(oi, truth | inject)
+
+    for e in E:  # for each extension
+        if not e in oi:
+            continue
+        tmp = {}
+        for k in oi[e]:  # for each observable
+            tmp[k] = {}
+            for o in oi[e][k]:  # for each telescope / baseline / triangle
+                if o in E[e]:
+                    # -- observations - bestmodel + bestmodel_with_injection
+                    tmp[k][o] = oi[e][k][o] - T[e][k][o] + I[e][k][o]
+                else:
+                    tmp[k][o] = oi[e][k][o].copy()
+        res[e] = tmp
     return res
 
 def _convolve(y, ker):
-    k = len(ker)
+    k = min(len(ker), len(y))
     _y = np.append(y, y[-k:][::-1])
     _y = np.append(_y[::-1], y[:k])[::-1]
     return np.convolve(_y, ker, mode="same")[k:-k]
 
-
-def _applyWlKernel(res, debug=False, fullWlRange=False):
-    """
-    """
-    if not ("fit" in res and "wl kernel" in res["fit"]):
+def _applyWlKernel(res, debug=False, fullWlRange=False, wlKernel=None, noT3=False):
+    """ """
+    if not wlKernel is None:
+        pass
+    elif not ("fit" in res and "wl kernel" in res["fit"]):
         return res
+    else:
+        wlKernel = res["fit"]["wl kernel"]
+
     # -- convolve by spectral Resolution
-    N = 2 * int(2 * res["fit"]["wl kernel"]) + 3
+    N = 2 * int(2 * wlKernel) + 3
     x = np.arange(N)
     ker = np.exp(
-        -((x - np.mean(x)) ** 2) / (2.0 * (res["fit"]["wl kernel"] / 2.35482) ** 2)
+        -((x - np.mean(x)) ** 2) / (2.0 * (wlKernel / 2.35482) ** 2)
     )
     ker /= np.sum(ker)
-
     # conv = lambda x: np.convolve(x, ker, mode='same')
     conv = lambda x: _convolve(x, ker)
     # conv = lambda x: x
@@ -3199,10 +3422,9 @@ def _applyWlKernel(res, debug=False, fullWlRange=False):
     else:
         w = res["WL"] > 0
 
-    if 'OI_FLUX' in res:
+    if "OI_FLUX" in res:
         for k in res["OI_FLUX"].keys():
             for i in range(res["OI_FLUX"][k]["FLUX"].shape[0]):
-                # print(res['OI_FLUX'][k]['FLUX'][i].shape, w.shape)
                 res["OI_FLUX"][k]["FLUX"][i][w] = conv(res["OI_FLUX"][k]["FLUX"][i][w])
 
     if "NFLUX" in res.keys():
@@ -3210,135 +3432,61 @@ def _applyWlKernel(res, debug=False, fullWlRange=False):
             for i in range(res["NFLUX"][k]["NFLUX"].shape[0]):
                 res["NFLUX"][k]["NFLUX"][i][w] = conv(res["NFLUX"][k]["NFLUX"][i][w])
 
-    if 'OI_VIS' in res:
-        for k in res["OI_VIS"].keys():
+    if "OI_VIS" in res:
+        for k in res["OI_VIS"].keys(): # for each baseline
             for i in range(res["OI_VIS"][k]["|V|"].shape[0]):
-                res["OI_VIS"][k]["|V|"][i][w] = conv(res["OI_VIS"][k]["|V|"][i][w])
-                res["OI_VIS"][k]["PHI"][i][w] = conv(res["OI_VIS"][k]["PHI"][i][w])
+                #res["OI_VIS"][k]["|V|"][i][w] = conv(res["OI_VIS"][k]["|V|"][i][w])
+                #res["OI_VIS"][k]["PHI"][i][w] = conv(res["OI_VIS"][k]["PHI"][i][w])
+                
+                # -- mimic phasor average:
+                tmp = conv(res["OI_VIS"][k]["|V|"][i][w]*np.exp(np.pi*1j*res["OI_VIS"][k]["PHI"][i][w]/180))
+                res["OI_VIS"][k]["|V|"][i][w] = np.abs(tmp)
+                res["OI_VIS"][k]["PHI"][i][w] = np.angle(tmp)*180/np.pi
+
                 if "DVIS" in res.keys() and "DPHI" in res["DVIS"][k]:
                     res["DVIS"][k]["DPHI"][i][w] = conv(res["DVIS"][k]["DPHI"][i][w])
                 if "DVIS" in res.keys() and "|V|" in res["DVIS"][k]:
                     res["DVIS"][k]["|V|"][i][w] = conv(res["DVIS"][k]["N|V|"][i][w])
-
-    if 'OI_CF' in res:
+            
+    if "OI_CF" in res:
         if "OI_CF" in res:
             for k in res["OI_CF"].keys():
                 for i in range(res["OI_CF"][k]["CF"].shape[0]):
-                    res["OI_CF"][k]["CF"][i][w] = conv(res["OI_CF"][k]["CF"][i][w])
-                    res["OI_CF"][k]["PHI"][i][w] = conv(res["OI_CF"][k]["PHI"][i][w])
+                    #res["OI_CF"][k]["CF"][i][w] = conv(res["OI_CF"][k]["CF"][i][w])
+                    #res["OI_CF"][k]["PHI"][i][w] = conv(res["OI_CF"][k]["PHI"][i][w])
 
-    if 'OI_VIS2' in res:
+                    # -- mimic phasor average:
+                    tmp = conv(res["OI_CF"][k]["CF"][i][w]*np.exp(np.pi*1j*res["OI_VIS"][k]["PHI"][i][w]/180))
+                    res["OI_CF"][k]["CF"][i][w] = np.abs(tmp)
+
+    if "OI_VIS2" in res:
         for k in res["OI_VIS2"].keys():
             for i in range(res["OI_VIS2"][k]["V2"].shape[0]):
                 res["OI_VIS2"][k]["V2"][i][w] = conv(res["OI_VIS2"][k]["V2"][i][w])
                 if "DVIS2" in res.keys() and "NV2" in res["DVIS2"][k]:
                     res["DVIS2"][k]["NV2"][i][w] = conv(res["DVIS2"][k]["NV2"][i][w])
 
-    if 'OI_T3' in res:
+    if not noT3 and "OI_T3" in res:
         for k in res["OI_T3"].keys():
             for i in range(res["OI_T3"][k]["MJD"].shape[0]):
-                res["OI_T3"][k]["T3PHI"][i][w] = conv(res["OI_T3"][k]["T3PHI"][i][w])
-                res["OI_T3"][k]["T3AMP"][i][w] = conv(res["OI_T3"][k]["T3AMP"][i][w])
+                #res["OI_T3"][k]["T3PHI"][i][w] = conv(res["OI_T3"][k]["T3PHI"][i][w])
+                #res["OI_T3"][k]["T3AMP"][i][w] = conv(res["OI_T3"][k]["T3AMP"][i][w])
 
-    if 'MODEL' in res:
-        for k in res['MODEL']:
-            if k.endswith(',flux') or k.endswith(',nflux') or k=='totalflux' or k=='totalnflux':
+                # -- mimic phasor average:
+                tmp = conv(res["OI_T3"][k]["T3AMP"][i][w]*np.exp(np.pi*1j*res["OI_T3"][k]["T3PHI"][i][w]/180))
+                res["OI_T3"][k]["T3AMP"][i][w] = np.abs(tmp)
+                res["OI_T3"][k]["T3PHI"][i][w] = np.angle(tmp)*180/np.pi
+
+    if "MODEL" in res:
+        for k in res["MODEL"]:
+            if (
+                k.endswith(",flux")
+                or k.endswith(",nflux")
+                or k == "totalflux"
+                or k == "totalnflux"
+            ):
                 res["MODEL"][k] = conv(res["MODEL"][k])
 
-    return res
-
-def _applyTF(res):
-    # == single target self-calibration -> assumes tel name have no '-'!!!
-    # "#TF_|V|_U1U2_*" -> overall coefficient
-    # "#TF_|V|_U1U2_+" -> overall coefficient
-    if any(["#TF" in k for k in res["param"].keys()]):
-        _debug = False
-        if _debug:
-            print("computing TF")
-        # -- organise the TF coefficient
-        TF = {}
-        for k in res["param"]:
-            if k.startswith("#TF"):
-                obs = k.split("_")[1]
-                if not obs in TF:
-                    TF[obs] = {}
-                b = k.split("_")[2]
-                if not b in TF[obs]:
-                    TF[obs][b] = {}
-                TF[obs][b][k.split("_")[3]] = res["param"][k]
-        if _debug:
-            print("TF:", TF)
-
-        O = {'V2': 'OI_VIS2',
-             '|V|': 'OI_VIS',
-             'T3PHI': 'OI_T3',
-             'PHI':'OI_VIS'
-            }
-        for o in TF:
-            if _debug:
-                print(" -> applying TF to", o)
-            for b in TF[o]: # for each baselines / triangles
-                if not O[o] in res:
-                    continue
-                if "all" in res[O[o]]:
-                    if b=='all':
-                        w = res[O[o]]["all"]["NAME"] != None
-                    else:
-                        w = res[O[o]]["all"]["NAME"] == b
-                    if "+" in TF[o][b]:
-                        res[O[o]]["all"][o][w] += TF[o][b]["+"]
-                    if "*" in TF[o][b]:
-                        res[O[o]]["all"][o][w] *= TF[o][b]["*"]
-                    if 's' in TF[o][b]:
-                        res[O[o]]["all"][o][w] *= (
-                            1 + (res["WL"] - np.mean(res["WL"]))[None, :] * TF[o][b]["s"]
-                        )
-                    if "wl0" in TF[o][b] and "wl2" in TF[o][b]:
-                        res[O[o]]["all"][o][w] *= (
-                            1 + (res["WL"] - TF[o][b]["wl0"])[None, :] * TF[o][b]["wl2"]
-                        )
-                    # -- polynomial multiplicative factor
-                    for sn in filter(lambda x: x.startswith('s') and x[1:].isdigit(), TF[o][b]):
-                        _n = int(sn[1:])
-                        res[O[o]]["all"][o][w] *= (
-                            1 + (res["WL"] - np.mean(res["WL"]))[None, :]**_n * TF[o][b][sn]
-                        )
-                    # -- polynomial additive factor
-                    for sn in filter(lambda x: x.startswith('+') and x[1:].isdigit(), TF[o][b]):
-                        _n = int(sn[1:])
-                        res[O[o]]["all"][o][w] += \
-                                (res["WL"] - np.mean(res["WL"]))[None, :]**_n * TF[o][b][sn]
-
-                else:
-                    if b == 'all':
-                        B = list(res[O[o]].keys())
-                    else:
-                        B = [b]
-                    for _b in B:
-                        if _b in res[O[o]]:
-                            if "+" in TF[o][b]:
-                                res[O[o]][_b][o] += TF[o][b]["+"]
-                            if "*" in TF[o][b]:
-                                res[O[o]][_b][o] *= TF[o][b]["*"]
-                            if 's' in TF[o][b]:
-                                res[O[o]][_b][o] *= (
-                                    1 + (res["WL"] - np.mean(res["WL"]))[None, :] * TF[o][b]["s"]
-                                )
-                            if "wl0" in TF[o][b] and "wl2" in TF[o][b]:
-                                res[O[o]][_b][o] *= (
-                                    1 + (res["WL"] - TF[o][b]["wl0"])[None, :] * TF[o][b]["wl2"]
-                                )
-                            # -- polynomial multiplicative factor
-                            for sn in filter(lambda x: x.startswith('s') and x[1:].isdigit(), TF[o][b]):
-                                _n = int(sn[1:])
-                                res[O[o]][_b][o] *= (
-                                    1 + (res["WL"] - np.mean(res["WL"]))[None, :]**_n * TF[o][b][sn]
-                                )
-                            # -- polynomial additive factor
-                            for sn in filter(lambda x: x.startswith('+') and x[1:].isdigit(), TF[o][b]):
-                                _n = int(sn[1:])
-                                res[O[o]][_b][o] += \
-                                    (res["WL"] - np.mean(res["WL"]))[None, :]**_n * TF[o][b][sn]
     return res
 
 
@@ -3377,20 +3525,10 @@ def computeLambdaParams(params, MJD=0):
                         elif s + "MJD" in tmp and not s in tmp.replace(s + "MJD", ""):
                             # -- no more replacement
                             compute = True
-                    for kp in sorted(list(paramsI.keys()), key=lambda x: -len(x)):
-                        if kp in tmp and not s + kp in tmp:
-                            raise Exception(
-                                "missing "
-                                + s
-                                + " for "
-                                + kp
-                                + " in {"
-                                + "'"
-                                + _k
-                                + '": "'
-                                + paramsI[k]
-                                + '"}?'
-                            )
+                    #for kp in sorted(list(paramsI.keys()), key=lambda x: -len(x)):
+                    #    if kp in tmp and not s + kp in tmp:
+                    #        raise Exception(
+                    #            "missing "+s+" for '"+kp+"' in {"+"'"+k+"': '"+paramsI[k]+"'}?")
                     # if s in tmp:
                     #    raise Exception('unknow parameters definition in {'+
                     #        "'"+_k+'": "'+paramsI[k]+'"}?')
@@ -3416,6 +3554,7 @@ def computeLambdaParams(params, MJD=0):
                         paramsR[k] = tmp
                     else:
                         paramsR[k] = eval(tmp.replace("(nan)", "(np.nan)"))
+
                 else:
                     paramsR[k] = tmp
             else:
@@ -3434,7 +3573,9 @@ def computeLambdaParams(params, MJD=0):
     return paramsR
 
 
-def computeDiffPhiOI(oi, param=None, order="auto", debug=False, visamp=True, vis2amp=True):
+def computeDiffPhiOI(
+    oi, param=None, order="auto", debug=False, visamp=True, vis2amp=True
+):
     if not param is None:
         _param = computeLambdaParams(param, MJD=np.mean(oi["MJD"]))
     else:
@@ -3479,7 +3620,7 @@ def computeDiffPhiOI(oi, param=None, order="auto", debug=False, visamp=True, vis
     # -- exclude where lines are in the models
     elif not _param is None:
         for k in _param.keys():
-            if "line_" in k and "wl0" in k:
+            if "line_" in k and "wl0" in k: # capture "line" and "pline" for rotating stars
                 dwl = 0
                 if k.replace("_wl0", "_gaussian") in _param.keys():
                     dwl = 1.5 * _param[k.replace("wl0", "gaussian")] / 1000.0
@@ -3571,8 +3712,8 @@ def computeDiffPhiOI(oi, param=None, order="auto", debug=False, visamp=True, vis
                     end=" ",
                 )
 
-            if "EPHI" in oi["OI_VIS"][k] or 'NAIVE_EPHI' in oi["OI_VIS"][k]:
-                if 'NAIVE_EPHI' in oi["OI_VIS"][k]:
+            if "EPHI" in oi["OI_VIS"][k] or "NAIVE_EPHI" in oi["OI_VIS"][k]:
+                if "NAIVE_EPHI" in oi["OI_VIS"][k]:
                     err = oi["OI_VIS"][k]["NAIVE_EPHI"][i, :].copy()
                 else:
                     err = oi["OI_VIS"][k]["EPHI"][i, :].copy()
@@ -3612,7 +3753,7 @@ def computeDiffPhiOI(oi, param=None, order="auto", debug=False, visamp=True, vis
             if np.sum(mask) > order:
                 phi[mask] = np.unwrap(phi[mask], period=360)
                 if not err is None:
-                    c = np.polyfit(oi["WL"][mask], phi[mask], order, w=1/err[mask])
+                    c = np.polyfit(oi["WL"][mask], phi[mask], order, w=1 / err[mask])
                 else:
                     c = np.polyfit(oi["WL"][mask], phi[mask], order)
                 # print('debug:', np.mean(phi[mask]-np.polyval(c, oi['WL'][mask])))
@@ -3622,6 +3763,7 @@ def computeDiffPhiOI(oi, param=None, order="auto", debug=False, visamp=True, vis
                     print("computeDiffPhiOI: removing median")
                 # -- not polynomial fit, use median
                 data.append(phi - np.median(phi))
+
         if visamp:
             vdata = []
             edata = []
@@ -3629,9 +3771,14 @@ def computeDiffPhiOI(oi, param=None, order="auto", debug=False, visamp=True, vis
                 vmask = w * ~oi["OI_VIS"][k]["FLAG"][i, :]
                 if "E|V|" in oi["OI_VIS"][k] or "NAIVE_E|V|" in oi["OI_VIS"][k]:
                     if "NAIVE_E|V|" in oi["OI_VIS"][k]:
-                        verr = oi["OI_VIS"][k]["NAIVE_E|V|"][i, :] / oi["OI_VIS"][k]["|V|"][i, :]
+                        verr = (
+                            oi["OI_VIS"][k]["NAIVE_E|V|"][i, :]
+                            / oi["OI_VIS"][k]["|V|"][i, :]
+                        )
                     else:
-                        verr = oi["OI_VIS"][k]["E|V|"][i, :] / oi["OI_VIS"][k]["|V|"][i, :]
+                        verr = (
+                            oi["OI_VIS"][k]["E|V|"][i, :] / oi["OI_VIS"][k]["|V|"][i, :]
+                        )
                     if "max error" in oi["fit"] and "N|V|" in oi["fit"]["max error"]:
                         # -- ignore data with large error bars
                         vmask *= verr < oi["fit"]["max error"]["N|V|"]
@@ -3709,10 +3856,15 @@ def computeDiffPhiOI(oi, param=None, order="auto", debug=False, visamp=True, vis
             for i, vis in enumerate(oi["OI_VIS2"][k]["V2"]):
                 vmask = w * ~oi["OI_VIS2"][k]["FLAG"][i, :]
                 if "EV2" in oi["OI_VIS2"][k]:
-                    if 'NAIVE_EV2' in oi["OI_VIS2"][k]:
-                        verr = oi["OI_VIS2"][k]["NAIVE_EV2"][i, :] / oi["OI_VIS2"][k]["V2"][i, :]
+                    if "NAIVE_EV2" in oi["OI_VIS2"][k]:
+                        verr = (
+                            oi["OI_VIS2"][k]["NAIVE_EV2"][i, :]
+                            / oi["OI_VIS2"][k]["V2"][i, :]
+                        )
                     else:
-                        verr = oi["OI_VIS2"][k]["EV2"][i, :] / oi["OI_VIS2"][k]["V2"][i, :]
+                        verr = (
+                            oi["OI_VIS2"][k]["EV2"][i, :] / oi["OI_VIS2"][k]["V2"][i, :]
+                        )
                     if "max error" in oi["fit"] and "NV2" in oi["fit"]["max error"]:
                         # -- ignore data with large error bars
                         vmask *= verr < oi["fit"]["max error"]["NV2"]
@@ -3794,12 +3946,13 @@ def computeDiffPhiOI(oi, param=None, order="auto", debug=False, visamp=True, vis
             oi["IM_VIS"][k]["DPHI"] = data
     return oi
 
+
 def computeNormFluxOI(oi, param=None, order="auto", debug=False):
     if type(oi) == list:
         return [computeNormFluxOI(o, _param, order) for o in oi]
 
     if not param is None:
-        #print('?', type(oi))
+        # print('?', type(oi))
         _param = computeLambdaParams(param, MJD=np.mean(oi["MJD"]))
     else:
         _param = None
@@ -3914,7 +4067,7 @@ def computeNormFluxOI(oi, param=None, order="auto", debug=False):
         # return oi
 
     # -- normalize flux in the data:
-    if 'OI_FLUX' in oi:
+    if "OI_FLUX" in oi:
         oi["NFLUX"] = {}
         for k in oi["OI_FLUX"].keys():
             data = []
@@ -3986,7 +4139,7 @@ def computeNormFluxOI(oi, param=None, order="auto", debug=False):
             oi["IM_FLUX"][k]["NFLUX"] = data
 
     if "MODEL" in oi.keys() and "totalflux" in oi["MODEL"].keys():
-        #mask = w
+        # mask = w
         c = np.polyfit(oi["WL"][w], oi["MODEL"]["totalflux"][w], order)
         for k in list(oi["MODEL"].keys()):
             if k.endswith(",flux"):
@@ -4357,7 +4510,7 @@ def residualsOI(
         # -- for each observable:
         if f in sorted(ext.keys()):
             if "PHI" in f:
-                rf = lambda x: ((x + 180) % 360 - 180)
+                rf = lambda x: (x + 180) % 360 - 180
             else:
                 rf = lambda x: x
 
@@ -4371,7 +4524,6 @@ def residualsOI(
                     mask = np.logical_and(w[None, :], ~oi[ext[f]][k]["FLAG"])
                     err = oi[ext[f]][k]["E" + f].copy()
                     if "baseline ranges" in oi["fit"]:
-                        # print('debug: baseline ranges')
                         bmask = np.zeros(mask.shape, dtype=bool)
                         for bmin, bmax in oi["fit"]["baseline ranges"]:
                             if "FLUX" in ext[f]:
@@ -4401,6 +4553,37 @@ def residualsOI(
                                     * (oi[ext[f]][k]["B/wl"] * oi["WL"] >= bmin),
                                 )
                         mask *= bmask
+
+                    if "spatial frequency ranges" in oi['fit']:
+                        fmask = np.zeros(mask.shape, dtype=bool)
+                        for fmin, fmax in oi["fit"]["spatial frequency ranges"]:
+                            if "FLUX" in ext[f]:
+                                fmask = np.ones(mask.shape, dtype=bool)
+                            elif "T3" in ext[f]:
+                                tmpmask = np.ones(mask.shape, dtype=bool)
+                                for b in ["B1", "B2", "B3"]:
+                                    try:
+                                        tmpmask = np.logical_and(
+                                            tmpmask,
+                                            (oi[ext[f]][k][b]/oi['WL'] <= fmax)
+                                            * (oi[ext[f]][k][b]/oi['WL'] >= fmin),
+                                        )
+                                    except:
+                                        tmpmask = np.logical_and(
+                                            tmpmask,
+                                            (
+                                                (oi[ext[f]][k][b]/oi['WL'] <= fmax)
+                                                * (oi[ext[f]][k][b]/oi['WL'] >= fmin)
+                                            )[:, None],
+                                        )
+                                fmask = np.logical_or(fmask, tmpmask)
+                            else:
+                                fmask = np.logical_or(
+                                    fmask,
+                                    (oi[ext[f]][k]["B/wl"] <= fmax)
+                                    * (oi[ext[f]][k]["B/wl"] >= fmin),
+                                )
+                        mask *= fmask
 
                     if "MJD ranges" in oi["fit"]:
                         mjdmask = np.zeros(mask.shape, dtype=bool)
@@ -4448,12 +4631,7 @@ def residualsOI(
                         try:
                             tmp = rf(oi[ext[f]][k][f][mask] - m[ext[f]][k][f][mask])
                         except:
-                            print(
-                                "!",
-                                oi[ext[f]][k][f].shape,
-                                mask.shape,
-                                m[ext[f]][k][f].shape,
-                            )
+                            print(f"! {oi[ext[f]][k][f].shape=}, {mask.shape=}, {m[ext[f]][k][f].shape=}")
                         if not ignoreErr is None:
                             _i = i + np.arange(len(tmp))
                             tmp /= err[mask] * (1 - ignoreErr[_i]) + ignoreErr[_i]
@@ -4513,7 +4691,7 @@ def residualsOI(
                                 else:
                                     kk = []
                                     if not "NAME" in oi[ext[f]][k]:
-                                        print("!", f, ext[f], k)
+                                        print("! NO NAME", f, ext[f], k)
                                     for _j, _n in enumerate(oi[ext[f]][k]["NAME"]):
                                         kk.extend([_n] * sum(mask[_j, :]))
 
@@ -4718,8 +4896,12 @@ def sparseFitOI(
             ignore = []
             # print('   checking', sparse)
             for k in sparse:
-                if type(significance)==dict and ',' in k and k.split(',')[0] in significance:
-                    sigma = significance[k.split(',')[0]]
+                if (
+                    type(significance) == dict
+                    and "," in k
+                    and k.split(",")[0] in significance
+                ):
+                    sigma = significance[k.split(",")[0]]
                 else:
                     sigma = significance
                 # -- must depart from 0 to be significant, otherwise 0
@@ -4815,7 +4997,7 @@ def sparseFitFluxes(
         for i in range(N[c]):
             k = c + ",fwvl_%04d" % i
             if c in initFlux:
-                param[k] = (i == 0) * initFlux[c] #* np.sqrt(2)**np.log2(N[c])
+                param[k] = (i == 0) * initFlux[c]  # * np.sqrt(2)**np.log2(N[c])
             else:
                 param[k] = (i == 0) * 1.0
             if k in fitOnly:
@@ -5257,12 +5439,14 @@ def randomiseData2(oi, verbose=False, keepFlux=False, onlyMJD=None):
             # -- do not randomise flux
             exts = list(
                 filter(
-                    lambda x: x
-                    in [
-                        "OI_VIS",
-                        "OI_VIS2",
-                        "OI_T3",
-                    ],
+                    lambda x: (
+                        x
+                        in [
+                            "OI_VIS",
+                            "OI_VIS2",
+                            "OI_T3",
+                        ]
+                    ),
                     tmp.keys(),
                 )
             )
@@ -5793,9 +5977,11 @@ def analyseGrid(fits, expl, debug=False, verbose=1, deltaChi2=None):
             for e in expl:
                 for k in expl[e]:
                     # -- fit barely moved compared to uncertainties
-                    if f["uncer"][k]>0:
-                       sigmove += (f["best"][k]-f["firstGuess"][k])**2 / f["uncer"][k]**2
-            test = sigmove<1
+                    if f["uncer"][k] > 0:
+                        sigmove += (f["best"][k] - f["firstGuess"][k]) ** 2 / f[
+                            "uncer"
+                        ][k] ** 2
+            test = sigmove < 1
 
             if test:
                 bad.append(f.copy())
@@ -5942,25 +6128,26 @@ def analyseGrid(fits, expl, debug=False, verbose=1, deltaChi2=None):
         #         t['firstGuess'].append(res[j]['firstGuess'])
     # print()
 
-    res = tmp
-    res = sorted(res, key=lambda r: r["chi2"])
+    res = sorted(tmp, key=lambda r: r["chi2"])
 
+    if verbose:
+        try:
+            print(time.asctime() + ": done")
+            print("-" * 12)
+            print("best fit: chi2=", res[0]["chi2"])
+            dpfit.dispBest(res[0])
+            if type(verbose) == int and verbose > 1:
+                dpfit.dispCor(res[0])
+        except:
+            pass 
+            
     # -- add bad fits:
-    for b in bad:
+    for i,b in enumerate(bad):
         res.append(b)
         if type(res[-1]["firstGuess"]) != list:
             res[-1]["firstGuess"] = [res[-1]["firstGuess"].copy()]
         res[-1]["bad"] = True
-    if verbose:
-        print(time.asctime() + ": done")
-        print("-" * 12)
-        print("best fit: chi2=", res[0]["chi2"])
-        dpfit.dispBest(res[0])
-    try:
-        if type(verbose) == int and verbose > 1:
-            dpfit.dispCor(res[0])
-    except:
-        pass
+
     return res
 
 
@@ -5983,13 +6170,14 @@ def showGrid(
 ):
     """
     res: results from a gridFitOI
-    px, py: the two parameters to show (default 2 first alphabetically)
-    color: color for the plot (default is chi2)
 
+    px, py: the two parameters to show (default 2 first alphabetically)
+
+    color: color for the plot (default is chi2)
     """
     global _gridAxes, _gridFig
     # print('debug sG:', '"'+px+'"', '"'+py+'"')
-    plt.close(fig)
+    closefig(fig)
     _gridFig = plt.figure(fig)
 
     if not aspect is None:
@@ -6001,7 +6189,7 @@ def showGrid(
         c = np.array(
             [_nSigmas(significance, r["chi2"], r["ndof"]) for r in res if ~r["bad"]]
         )
-        color = r"significance min($\sigma$, 8)"
+        color = r"significance ($\sigma$)"
     else:
         # -- color of local minima
         if not color == "chi2":
@@ -6100,7 +6288,7 @@ def showGrid(
         plt.plot(
             x[0],
             y[0],
-            #marker=r"$\bigodot$",
+            # marker=r"$\bigodot$",
             marker=r"$\oplus$",
             # color=matplotlib.cm.get_cmap(cmap)(0),
             color=plt.get_cmap(cmap)(255),
@@ -6240,22 +6428,6 @@ def bootstrapFitOI(
     firstGuess = fit["best"]
     uncer = fit["uncer"]
 
-    kwargs = {
-        "maxfev": maxfev,
-        "ftol": ftol,
-        "verbose": False,
-        "fitOnly": fitOnly,
-        "doNotFit": doNotFit,
-        "epsfcn": epsfcn,
-        "randomise": True,
-        "prior": prior,
-        "iter": -1,
-        "keepFlux": keepFlux,
-        "onlyMJD": strongMJD,
-        "lowmemory": True,
-        "additionalRandomise": additionalRandomise,
-        "correlations": correlations,
-    }
     res = []
     t = time.time()
     if multi:
@@ -6276,7 +6448,22 @@ def bootstrapFitOI(
             microprogress.progress(0)
 
         for i in range(N):
-            kwargs["iter"] = i
+            kwargs = {
+                "maxfev": maxfev,
+                "ftol": ftol,
+                "verbose": False,
+                "fitOnly": fitOnly,
+                "doNotFit": doNotFit,
+                "epsfcn": epsfcn,
+                "randomise": True,
+                "prior": prior,
+                "iter": i,
+                "keepFlux": keepFlux,
+                "onlyMJD": strongMJD,
+                "lowmemory": True,
+                "additionalRandomise": additionalRandomise,
+                "correlations": correlations,
+            }
             if randomiseParam:
                 # -- todo: should use the covariance matrix!
                 if type(randomiseParam) != bool:
@@ -6295,6 +6482,40 @@ def bootstrapFitOI(
                     }
             else:
                 tmpfg = firstGuess
+            if any([k.startswith("#TF") for k in tmpfg]):
+                ext = {
+                    "|V|": "OI_VIS",
+                    "V2": "OI_VIS2",
+                    "T3PHI": "OI_T3",
+                    "T3AMP": "OI_T3",
+                    "PHI": "OI_VIS",
+                    "CF": "OI_CF",
+                }
+                TF = [k for k in tmpfg if k.startswith("#TF")]
+                _doNotFitTF = []
+                for tf in TF:
+                    k = tf.split("_")[2]
+                    o = tf.split("_")[1]
+                    e = ext[o]
+                    anydata = False
+                    for d in oi:
+                        if e in d and k in d[e]:
+                            # -- WARNING, not taking into account error and wl filtering!!!
+                            anydata = anydata or any(~d[e][k]["FLAGS"].flatten())
+                    if not (anydata):
+                        _doNotFitTF.append(tf)
+
+                # if kwargs['fitOnly'] in [None, []] and kwargs['doNotfit'] in [None, []]:
+                #     kwargs['doNotfit'] = _doNotFitTF
+                # elif kwargs['fitOnly'] in [None, []]:
+                #     # -- only doNotFit is defined
+                #     kwargs['doNotfit'] += _doNotFitTF
+                # else:
+                #     # -- only fitOnly is defined
+                #     kwargs['fitOnly'] = [k for k in kwargs['fitOnly'] if not k in _doNotFitTF]
+                # for k in ['fitOnly', 'doNotFit']:
+                #     print(k, kwargs[k])
+
             if verbose:
                 res.append(
                     pool.apply_async(
@@ -6326,6 +6547,23 @@ def bootstrapFitOI(
             r["y"] = None
             r["y"] = None
     else:
+        kwargs = {
+            "maxfev": maxfev,
+            "ftol": ftol,
+            "verbose": False,
+            "fitOnly": fitOnly,
+            "doNotFit": doNotFit,
+            "epsfcn": epsfcn,
+            "randomise": True,
+            "prior": prior,
+            "iter": 0,
+            "keepFlux": keepFlux,
+            "onlyMJD": strongMJD,
+            "lowmemory": True,
+            "additionalRandomise": additionalRandomise,
+            "correlations": correlations,
+        }
+
         Np = 1
         t = time.time()
         _prog_N = 1
@@ -6524,7 +6762,7 @@ def sigmaClippingOI(oi, sigma=4, n=5, param=None):
                 if k.replace("wl0", "lorentzian") in param.keys():
                     dwl = 3 * param[k.replace("wl0", "lorentzian")] / 1000.0
                 if k.replace("wl0", "truncexp") in param.keys():
-                    dwl = 2 * param[k.replace("wl0", "lorentzian")] / 1000.0
+                    dwl = 2 * param[k.replace("wl0", "truncexp")] / 1000.0
                 vel = 0
                 if "," in k:
                     kv = k.split(",")[0] + "," + "Vin"
@@ -6673,6 +6911,7 @@ def showOI(
     t3B="max",
     modelNames=None,
     modelColors=None,
+    unwrap180=False,
 ):
     """
     oi: result from oifits.loadOI
@@ -6781,6 +7020,7 @@ def showOI(
                 t3B=t3B,
                 modelNames=modelNames,
                 modelColors=modelColors,
+                unwrap180=unwrap180,
             )
             if not param is None:
                 if "fit" in o and "obs" in o["fit"] and "NFLUX" in o["fit"]["obs"]:
@@ -6794,9 +7034,9 @@ def showOI(
                     else:
                         allWLc.extend(list(m["WL"]))
             allMJD.extend(list(o["MJD"]))
-            if 'fit' in o and 'wl kernel' in o['fit']:
-                #print('saving kernel')
-                kernel.append(o['fit']['wl kernel'])
+            if "fit" in o and "wl kernel" in o["fit"]:
+                # print('saving kernel')
+                kernel.append(o["fit"]["wl kernel"])
 
             models.append(m)
 
@@ -6804,9 +7044,9 @@ def showOI(
         allWLs = np.array(sorted(list(set(allWLs))))
         allMJD = np.array(sorted(list(set(allMJD))))
         kernel = list(set(kernel))
-        #print('kernel:', kernel)
-        if len(kernel)>1:
-            print('warning: ambiguous wl kernel for global computation!')
+        # print('kernel:', kernel)
+        if len(kernel) > 1:
+            print("warning: ambiguous wl kernel for global computation!")
         if showIm and not imFov is None:
             fluxes = {}
             spectra = {}
@@ -6817,8 +7057,8 @@ def showOI(
                     "fit": {"obs": []},
                     "MJD": allMJD,
                 }  # minimum required
-                if len(kernel)==1:
-                    print('wl kernel!')
+                if len(kernel) == 1:
+                    print("wl kernel!")
                     allWl["fit"]["wl kernel"] = kernel[0]
                 tmp = showModel(
                     allWL,
@@ -6852,8 +7092,8 @@ def showOI(
                     "fit": {"obs": ["NFLUX"]},  # force computation of continuum
                     "MJD": allMJD,
                 }
-                if len(kernel)==1:
-                    print('wl kernel!')
+                if len(kernel) == 1:
+                    print("wl kernel!")
                     allWl["fit"]["wl kernel"] = kernel[0]
                 tmp = showModel(
                     allWL,
@@ -6985,6 +7225,7 @@ def showOI(
     # -- force recomputing differential quantities
     if "WL cont" in oi.keys():
         oi.pop("WL cont")
+
     if "DPHI" in obs or "N|V|" in obs or "NV2" in obs:
         if debug:
             print(" (re-)compute DiffPhi in data")
@@ -7048,6 +7289,18 @@ def showOI(
         if debug:
             print("no parameters given")
         m = None
+        Ms = []
+
+    if type(param)==dict:
+        Ps = [param]
+    elif type(param)==list:
+        Ps = param
+
+    for i,_m in enumerate(Ms):
+        if 'DPHI' in obs or 'N|V|' in obs or 'NV2' in obs:
+            _m = computeDiffPhiOI(_m, computeLambdaParams(Ps[i], MJD=np.mean(_m["MJD"])))
+        if 'NFLUX' in obs:
+            _m = computeNormFluxOI(_m, computeLambdaParams(Ps[i], MJD=np.mean(_m["MJD"])))
 
     c = 1  # column
     ax0 = None
@@ -7176,10 +7429,24 @@ def showOI(
 
     markers = ["d", "o", "*", "^", "v", ">", "<", "P", "X"]
     if not spectro:
-        #colors = list(itertools.permutations([0.2, 0.7, 0.9])) + ["0.5"]
-        #colors += [(0.2, 0.2, 0.8), (0.2, 0.8, 0.2), (0.8, 0.2, 0.2)]
-        #colors = matplotlib.colormaps['Set2'](np.linspace(0.05, 0.95, 8))
-        colors = matplotlib.colormaps['Paired'](np.linspace(1/24, 1-1/6-1/24, 10))
+        # colors = matplotlib.colormaps["Paired"](
+        #     np.linspace(1 / 24, 1 - 1 / 24, 12))
+        # colors = list(colors[1::2])+list(colors[0::2])
+
+        colors = matplotlib.colormaps["tab10"](
+            np.linspace(1/20, 1 - 1/20, 10))
+        colors = matplotlib.colormaps["Dark2"](
+            np.linspace(1/16, 1 - 1/16, 8))
+        #colors = list(colors)[-1::-2] + list(colors)[-2::-2]
+
+        colors = matplotlib.colormaps["Set1"](
+            np.linspace(1/18, 1 - 1/18, 9))[[0,1,2,3,4,6,7,8]]
+        colors = list(colors)[1:5] + list(colors)[-1:-3:-1]
+        #colors = list(colors)[-1::-2] + list(colors)[-2::-2]
+
+        colors = matplotlib.colormaps["tab20"](
+            np.linspace(1/40, 1 - 1/40, 20))
+        colors = list(colors)[0::2] + list(colors)[1::2]        
 
     else:
         colors = matplotlib.colormaps[cmapBaselines](
@@ -7194,7 +7461,7 @@ def showOI(
     if not figWidth is None and figHeight is None:
         figHeight = max(figWidth / ncol, FIG_MAX_HEIGHT)
     if not allInOne or ai1ax == {}:
-        plt.close(fig)
+        closefig(fig)
         ai1fig = plt.figure(fig, figsize=(figWidth, figHeight))
 
     i_flux = 0
@@ -7316,7 +7583,7 @@ def showOI(
                 ax.plot(b * np.cos(t), b * np.sin(t), ":k", alpha=0.2)
 
             bmax = 1.1 * np.max(bmax)
-            ax.legend(fontsize=5, loc="upper left", ncol=3)
+            ax.legend(fontsize=6, loc="upper left", ncol=3)
             # ax.set_title('u,v (m)', fontsize=10)
             # ax.set_xlabel('u')
             # ax.set_ylabel('v')
@@ -7536,12 +7803,22 @@ def showOI(
                 # -- data:
                 y = oi[data[l]["ext"]][k][data[l]["var"]][j, :]
                 if "PHI" in l and any(mask):  # and np.ptp(y[mask])>300:
-                    y[mask] = np.unwrap(y[mask] * np.pi / 180) * 180 / np.pi
-                    y[mask] = (
-                        np.mod(y[mask] - np.mean(y[mask]) + 180, 360)
-                        + np.mean(y[mask] - 180) % 360
-                        - 360
-                    )
+                    if unwrap180:
+                        #print('unwrap180 data')
+                        y[mask] = np.unwrap(y[mask], period=180) 
+                        y[mask] = (
+                            np.mod(y[mask] - np.mean(y[mask]) + 90, 180)
+                            + np.mean(y[mask] - 90) % 180
+                            - 180
+                        )
+                    else:
+                        y[mask] = np.unwrap(y[mask], period=360) 
+                        y[mask] = (
+                            np.mod(y[mask] - np.mean(y[mask]) + 180, 360)
+                            + np.mean(y[mask] - 180) % 360
+                            - 360
+                        )
+
                     # y[flagged] = np.unwrap(y[flagged]*np.pi/180)*180/np.pi
                     # y[flagged] = np.mod(y[flagged]+180, 360)-180
                     pass
@@ -7550,17 +7827,6 @@ def showOI(
                 ign = (~mask).copy()
                 showIgn = False
                 if "baseline ranges" in oi["fit"]:
-                    # for bmin, bmax in oi['fit']['baseline ranges']:
-                    #     if 'FLUX' in data[l]['ext']:
-                    #         pass
-                    #     elif 'T3' in data[l]['ext']:
-                    #         for b in ['B1', 'B2', 'B3']:
-                    #             mask *= ((oi[data[l]['ext']][k][b][j]<=bmax)*
-                    #                         (oi[data[l]['ext']][k][b][j]>=bmin))
-                    #     else:
-                    #         mask *= (oi[data[l]['ext']][k]['B/wl'][j,:]*oi['WL']<=bmax)*\
-                    #                 (oi[data[l]['ext']][k]['B/wl'][j,:]*oi['WL']>=bmin)
-
                     bmask = np.zeros(mask.shape, dtype=bool)
                     for bmin, bmax in oi["fit"]["baseline ranges"]:
                         if "FLUX" in data[l]["ext"]:
@@ -7594,10 +7860,37 @@ def showOI(
                             )
                     mask *= bmask
 
-                # if 'MJD ranges' in oi['fit']:
-                #     for mjdmin, mjdmax in oi['fit']['MJD ranges']:
-                #         mask *= (oi[data[l]['ext']][k]['MJD2'][j,:]<=mjdmax)*\
-                #                 (oi[data[l]['ext']][k]['MJD2'][j,:]>=mjdmin)
+                if "spatial frequency ranges" in oi['fit']:
+                    fmask = np.zeros(mask.shape, dtype=bool)
+                    for fmin, fmax in oi["fit"]["spatial frequency ranges"]:
+                        if "FLUX" in data[l]["ext"]:
+                            fmask = np.ones(mask.shape, dtype=bool)
+                        elif "T3" in data[l]["ext"]:
+                            tmpmask = np.ones(mask.shape, dtype=bool)
+                            for b in ["B1", "B2", "B3"]:
+                                try:
+                                    tmpmask = np.logical_and(
+                                        tmpmask,
+                                        (oi[data[l]["ext"]][k][b][j]/oi['WL'] <= fmax)
+                                        * (oi[data[l]["ext"]][k][b][j]/oi['WL'] >= fmin),
+                                    )
+                                except:
+                                    tmpmask = np.logical_and(
+                                        tmpmask,
+                                        (
+                                            (oi[data[l]["ext"]][k][b][j]/oi['WL'] <= fmax)
+                                            * (oi[data[l]["ext"]][k][b][j]/oi['WL'] >= fmin)
+                                        )[:, None],
+                                    )
+                            fmask = np.logical_or(fmask, tmpmask)
+                        else:
+                            fmask = np.logical_or(
+                                fmask,
+                                  (oi[data[l]["ext"]][k]["B/wl"][j, :] <= fmax)
+                                * (oi[data[l]["ext"]][k]["B/wl"][j, :] >= fmin),
+                            )
+                    mask *= fmask
+
                 if "MJD ranges" in oi["fit"]:
                     mjdmask = np.zeros(mask.shape, dtype=bool)
                     for mjdmin, mjdmax in oi["fit"]["MJD ranges"]:
@@ -7790,12 +8083,22 @@ def showOI(
                         if not k in m[data[l]["ext"]].keys():
                             k = list(m[data[l]["ext"]].keys())[0]
                         ym = m[data[l]["ext"]][k][data[l]["var"]][j, :]
-                        ym[mask] = np.unwrap(ym[mask] * np.pi / 180) * 180 / np.pi
-                        ym[mask] = (
-                            np.mod(ym[mask] + 180 - np.mean(ym[mask]), 360)
-                            + (np.mean(ym[mask]) - 180) % 360
-                            - 360)
-
+                        if 'PHI' in l:
+                            if unwrap180:
+                                #print('unwrap180 model')
+                                ym[mask] = np.unwrap(ym[mask], period=180)
+                                ym[mask] = (
+                                    np.mod(ym[mask] + 90 - np.mean(ym[mask]), 180)
+                                    + (np.mean(ym[mask]) - 90) % 180
+                                    - 180
+                                )
+                            else:
+                                ym[mask] = np.unwrap(ym[mask], period=360)
+                                ym[mask] = (
+                                    np.mod(ym[mask] + 180 - np.mean(ym[mask]), 360)
+                                    + (np.mean(ym[mask]) - 180) % 360
+                                    - 360
+                                )
                         # -- computed chi2 *in the displayed window*
                         maskc2 = mask * (oi["WL"] >= wlMin) * (oi["WL"] <= wlMax)
 
@@ -7817,10 +8120,10 @@ def showOI(
                                     ym[maskc2],
                                     "-",
                                     alpha=0.5 if not test else 0.3,
-                                    color=color, #if col == "k" else "0.5",
+                                    color=color,  # if col == "k" else "0.5",
                                     linewidth=2,
                                 )
-                                #if col != "k":
+                                # if col != "k":
                                 ax.plot(
                                     X(m, j)[maskc2],
                                     ym[maskc2],
@@ -7871,6 +8174,9 @@ def showOI(
                                 color=color,
                                 label=label,
                             )
+                            # if l=='T3PHI':
+                            #     print('T3PHI:', ym[maskc2])
+
                         try:
                             ymin = min(ymin, np.min(ym[maskp] + yoffset * i))
                             ymax = max(ymax, np.max(ym[maskp] + yoffset * i))
@@ -7921,18 +8227,23 @@ def showOI(
 
                 # -- show phase based on OPL
                 if False and l == "PHI" and "OPL" in oi.keys():
-                    dOPL = oi["OPL"][k[:2]] - oi["OPL"][k[2:]] # assume telescopes have 2 char in name!!!
+                    dOPL = (
+                        oi["OPL"][k[:2]] - oi["OPL"][k[2:]]
+                    )  # assume telescopes have 2 char in name!!!
                     wl0 = oi["WL"].mean()
                     cn = np.polyfit(oi["WL"] - wl0, oi["n_lab"], 8)
-                    cn[-2:] = 0.0 # remove offset, slope and curvature
+                    cn[-2:] = 0.0  # remove offset, slope and curvature
                     print(k, cn)
-                    phicurve = 360*dOPL*np.polyval(cn, oi["WL"] - wl0)/(oi["WL"]*1e-6)+yoffset*i
-                    if not param is None and '#TF_PHI_'+k+'_+' in param:
-                         phicurve += param['#TF_PHI_'+k+'_+']
-                    if not param is None and '#TF_PHI_'+k+'_+0' in param:
-                         phicurve += param['#TF_PHI_'+k+'_+0']
+                    phicurve = (
+                        360 * dOPL * np.polyval(cn, oi["WL"] - wl0) / (oi["WL"] * 1e-6)
+                        + yoffset * i
+                    )
+                    if not param is None and "#TF_PHI_" + k + "_+" in param:
+                        phicurve += param["#TF_PHI_" + k + "_+"]
+                    if not param is None and "#TF_PHI_" + k + "_+0" in param:
+                        phicurve += param["#TF_PHI_" + k + "_+0"]
 
-                    ax.plot(oi["WL"], phicurve, "--", linewidth=1, alpha=0.5, color='b')
+                    ax.plot(oi["WL"], phicurve, "--", linewidth=1, alpha=0.5, color="b")
 
             # -- end loop on MJDs
 
@@ -8010,14 +8321,16 @@ def showOI(
                 if bckgGrid:
                     # ax.grid(color=(0.2, 0.4, 0.7), alpha=0.2)
                     ax.grid(color=(0.4, 0.6, 0.9), alpha=0.15)
-
             else:
-                if l in ["V2", "|V|"]:
+                if l in ["V2", "|V|", "T3AMP"]:
                     if logV:
-                        ax.set_ylim(1e-4, 1)
+                        #ax.set_ylim(0.5e-5, 1)
+                        #if l=="T3AMP":
+                        #    ax.set_ylim(1e-6, 1)
                         ax.set_yscale("log")
                     elif not autoLimV:
-                        ax.set_ylim(0, 1)
+                        #ax.set_ylim(0, 1)
+                        pass
                     else:
                         # ax.set_ylim(0)
                         pass
@@ -8060,6 +8373,8 @@ def showOI(
                     title += " (%s)" % oi["units"][l]
                 elif "unit" in data[l]:
                     title += " (%s)" % data[l]["unit"]
+                if 'PHI' in l and unwrap180:
+                    title += ' mod 180º'
 
                 ax.set_title(title)
                 if not vWl0 is None:
@@ -8067,7 +8382,11 @@ def showOI(
                 if l == "NFLUX":
                     ax.set_xlabel(Xlabel)
             # if (allInOne or l=='T3PHI') and showLegend:
-            #    ax.legend(fontsize=5, ncol=4)
+            #     if (not showUV and (l=='T3PHI' or l=='V2' or l=='|V|')) and not spectro:
+            if showLegend and not spectro and (l=='T3PHI' or not showUV):
+                ax.legend(fontsize=5.5 if showUV else 6, 
+                    loc='upper center', ncol=4 if l=='T3PHI' else 6)
+            
         i_col += 1
         if debug:
             print()
@@ -8210,8 +8529,7 @@ def showModel(
         figHeight = max(figWidth / nplot, FIG_MAX_HEIGHT)
 
     # print('showModel: fighWidth, figHeight=', figWidth, figHeight)
-
-    plt.close(fig)
+    closefig(fig)
     plt.figure(fig, figsize=(figWidth, figHeight))
 
     if "cube" in m["MODEL"].keys():
@@ -8659,7 +8977,7 @@ def halfLightRadiusFromParam(param, comp=None, fig=None, verbose=True):
     _cf /= _cf.max()
     rh = np.interp(0.5, _cf, _r)
     if not fig is None:
-        plt.close(fig)
+        closefig(fig)
         plt.figure(fig)
         plt.plot(_r, _p)
     return rh
@@ -8717,7 +9035,7 @@ def halfLightRadiusFromImage(oi, icube, incl, projang, x0=None, y0=None, fig=Non
     rh = np.interp(0.5, cF, r)
 
     if not fig is None:
-        plt.close(fig)
+        closefig(fig)
         plt.figure(fig, figsize=(9, 5))
         ax = plt.subplot(121, aspect="equal")
         plt.pcolormesh(
@@ -8817,22 +9135,22 @@ def showBootstrap(
         filter(
             lambda k: k not in combParam.keys() and k not in ignore, boot["fitOnly"]
         ),
-        key=lambda k: k
-        if not k in alternateParameterNames
-        else alternateParameterNames[k],
+        key=lambda k: (
+            k if not k in alternateParameterNames else alternateParameterNames[k]
+        ),
     )
     showP += sorted(
         filter(lambda k: k in combParam.keys() and k not in ignore, boot["fitOnly"]),
-        key=lambda k: k
-        if not k in alternateParameterNames
-        else alternateParameterNames[k],
+        key=lambda k: (
+            k if not k in alternateParameterNames else alternateParameterNames[k]
+        ),
     )
 
     if figWidth is None:
         figWidth = min(FIG_MAX_WIDTH, 1 + 2 * len(showP))
 
     fontsize = max(min(9 * figWidth / len(showP), 14), 6)
-    plt.close(fig)
+    closefig(fig)
     _bootFig = plt.figure(fig, figsize=(figWidth, figWidth))
     _AX = {}
 
@@ -8954,18 +9272,10 @@ def showBootstrap(
                 )
 
                 n = int(np.ceil(-np.log10(boot["uncer"][k1]) + 1))
-                fmt = (
-                    "%s\n"
-                    + "%."
-                    + "%d" % max(n, 0)
-                    + "f\n"
-                    + r"$\pm$"
-                    + "%."
-                    + "%d" % max(n, 0)
-                    + "f"
-                )
+                fmt = "%s\n"+"%."+"%d" % max(n, 0)+"f\n"+r"$\pm$"+"%."+"%d" % max(n, 0)+"f"
+                
                 plt.title(
-                    fmt % (T1, boot["best"][k1], boot["uncer"][k1]), fontsize=fontsize
+                   r''+fmt % (T1, boot["best"][k1], boot["uncer"][k1]), fontsize=fontsize
                 )
 
             else:
@@ -8983,34 +9293,24 @@ def showBootstrap(
                 check = 2*np.abs(boot['uncer+'][k1]-boot['uncer-'][k1])/\
                           (boot['uncer+'][k1]+boot['uncer-'][k1]) < 0.2
                 if check:
-                    fmt = (
-                        "%s\n"
-                        + "%."
-                        + "%d" % max(n, 0)
-                        + "f\n"
-                        + r"$\pm$"
-                        + "%."
-                        + "%d" % max(n, 0)
-                        + "f"
-                    )
-                    plt.title(
-                        fmt % (T1, boot["best"][k1], boot["uncer"][k1]),
-                        fontsize=fontsize,
-                    )
+                    tmp = [T1, 
+                            "%."+"%d"%max(n, 0)+"f",
+                            r"$\pm$%."+"%d" % max(n, 0)+"f"
+                        ]
+                    tmp[1] = tmp[1]%boot["best"][k1]
+                    tmp[2] = tmp[2]%boot["uncer"][k1]
+                    tmp = tmp[0]+'\n'+tmp[1]+'\n'+eval('r"'+tmp[2]+'"')
+                    plt.title(tmp, fontsize=fontsize)
                 else:
-                    fmt = "%s\n" + "%." + "%d" % max(n, 0) + "f\n"
-                    fmt += r"$^{+" + "%." + "%d" % max(n, 0) + "f}"
-                    fmt += r"_{-" + "%." + "%d" % max(n, 0) + "f}$"
-                    plt.title(
-                        fmt
-                        % (
-                            T1,
-                            boot["best"][k1],
-                            boot["uncer+"][k1],
-                            boot["uncer-"][k1],
-                        ),
-                        fontsize=fontsize,
-                    )
+                    tmp = [T1, 
+                        "%." + "%d" % max(n, 0) + "f", 
+                        #r"$ ^{+" + "%." + "%d" % max(n, 0) + "f}_{-" + "%." + "%d" % max(n, 0) + "f} $",
+                        r"$_{-" + "%." + "%d" % max(n, 0) + "f}^{+" + "%." + "%d" % max(n, 0) + "f}$"]
+                        
+                    tmp[1] = tmp[1]%boot["best"][k1]
+                    tmp[2] = tmp[2]%(boot["uncer-"][k1], boot["uncer+"][k1])
+                    tmp = tmp[0]+'\n'+tmp[1]+'\n'+eval('r"'+tmp[2]+'"')
+                    plt.title(tmp, fontsize=fontsize)
 
         if showSingleFit and i1 == 0:
             plt.legend(fontsize=5)
@@ -9216,6 +9516,10 @@ def showBootstrap(
                 _AY[i2].tick_params(axis="y", labelsize=fontsize * 0.8)
             else:
                 ax.yaxis.set_visible(False)
+    # try:
+    #     plt.tight_layout()
+    # except:
+    #     print('failed to run tight_layout()')
     plt.tight_layout()
     plt.subplots_adjust(
         hspace=0,  # 0.65*fig.subplotpars.hspace,
@@ -9282,7 +9586,7 @@ def _Vazvar(
     V0=None,
     numerical=False,
     XY=None,
-    nB=30,
+    nB=200,
     numVis=False,
 ):
     """
@@ -9604,7 +9908,7 @@ def testAzVar():
     print("Image min/max = %f / %f" % (np.min(I), np.max(I)))
     # == Show result =======================================
     print("speedup: x%.0f" % (tn / tsa))
-    plt.close(0)
+    closefig(0)
     plt.figure(0, figsize=(11, 4))
     plt.clf()
     plt.subplots_adjust(
